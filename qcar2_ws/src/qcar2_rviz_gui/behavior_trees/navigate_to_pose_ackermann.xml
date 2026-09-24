@@ -1,0 +1,133 @@
+<!--
+  QCar2 navigation behavior tree.
+
+  This is Nav2's stock navigate_to_pose_w_replanning_and_recovery.xml with the
+  two recovery behaviors that do not suit an Ackermann-steered car removed:
+
+  * <Spin> asks the robot to rotate on the spot.  A QCar2 steers with its front
+    wheels and physically cannot do this, so the behavior just ran its full
+    duration commanding a yaw rate the car could never achieve, achieving
+    nothing but delay before the RoundRobin advanced to the next recovery.
+
+  <BackUp> is RESTORED (0.25 m at 0.12 m/s).  It was removed earlier because
+  the car would reverse indefinitely: the converter latched the last command
+  forever, so when BackUp finished and stopped publishing, the reverse command
+  stayed applied.  That root cause is fixed — nav2_qcar_command_convert.cpp
+  now zeroes speed and steering if /cmd_vel goes quiet for 150 ms — and the
+  car is deliberately reversing-capable now, so backing up is exactly the
+  right way out of the "wedged against a wall and cannot move" state.
+
+  Recoveries are therefore: back up, then clear both costmaps.  BackUp is
+  deliberately FIRST.  The case that actually happens on this car is someone
+  stepping in close while it drives: MPPI is then boxed in, its only
+  obstacle-free option is to inch forward, and the car crawls (with the
+  steering hunting, since the cmd_vel->steering-angle conversion divides by
+  speed — now floored, see kSteeringRefSpeed in
+  nav2_qcar_command_convert.cpp) until the progress checker calls it stuck.
+  Clearing the costmaps first wasted that whole cycle: the person is really
+  there, so the LiDAR re-marks them within one update and nothing has
+  changed except that another movement_time_allowance has to elapse before
+  the next recovery is tried.  Backing up is the move that genuinely creates
+  room to plan around them, so it goes first and clearing stays as the
+  follow-up for the other case, a stale/ghost mark that no longer exists.
+  Note this only ever runs when the car is ALREADY stuck — if MPPI can find
+  a way around without stopping, it simply drives it and no recovery is
+  reached at all, which is the intended "manoeuvre if you can, back up if
+  you cannot" split.  Wait is
+  REMOVED per an explicit operator request: the car must always be doing
+  something toward the goal, never idling.  Understand the trade this makes:
+  Wait existed to give a moving obstacle time to leave before retrying, and
+  without it a blockage that clearing + backing up cannot resolve is retried
+  immediately in a tight loop instead of pausing.  ObstaclesCritic still stops
+  the car short of a real obstacle either way; this only removes the
+  deliberate pause between attempts.
+
+  NavigateRecovery's number_of_retries was 6.  nav2_behavior_tree's
+  RecoveryNode (recovery_node.hpp) returns FAILURE outright once that count is
+  exhausted: bt_navigator then ABORTS the whole goal, every server stops
+  publishing, and nav2_qcar_command_convert.cpp's 150 ms watchdog zeroes the
+  motors.  The car does not idle at that point, it is DONE: nothing will move
+  it again until a fresh goal arrives.  That silent abort, not a hang, is what
+  looked like "it stopped for no reason", and 6 cycles at ~1 Hz was only a few
+  seconds of genuine trying before giving up.
+
+  The operator's follow-up correction is important: not "try forever", but
+  "keep trying continuously (no idle stops), and tell me it genuinely failed
+  after about 2 minutes of real effort, or if a path truly cannot be found".
+  A raw retry COUNT cannot express a wall-clock deadline: each cycle's real
+  duration depends on how long planning, driving and recovery each take, so
+  the same number means a different amount of real time every run.  The
+  number_of_retries here is left very high (100000, in practice unreachable)
+  purely as a defence-in-depth backstop; the actual 2-minute deadline is
+  enforced below by wrapping this whole node in a BT.CPP core Timeout
+  decorator, which measures real elapsed time regardless of how the cycles
+  inside are spent.  The car only stops now via that timeout, cancellation
+  (new 2D Pose Estimate, see qcar2_goal_reset.py), or success.
+
+  The Timeout decorator (msec port) is confirmed present in the exact
+  libbehaviortree_cpp_v3.so this ROS distribution links (Timeout / TimeoutNode
+  symbols found in the library), so it is a BT.CPP core decorator, not a nav2
+  plugin: it needs no plugin_lib_names entry and is auto-registered.  It ticks
+  its one child normally; if that child has not returned SUCCESS or FAILURE
+  within the given milliseconds of when it started running, the decorator
+  halts the child and returns FAILURE itself.  bt_navigator resets tree node
+  state at the start of each new navigation goal, so this 2 minutes runs per
+  goal attempt, not cumulatively across separate goals sent over a session.
+  On expiry the wrapped RecoveryNode, meaning everything inside it (planning,
+  driving, clearing costmaps, backing up), is cut off together and the goal is
+  reported ABORTED, which qcar2_nav_visualizer.py already turns into the
+  on-screen "NAV FAILED" banner.  This is therefore also the answer to "tell
+  me if a path genuinely
+  cannot be made": if ComputePathToPose keeps failing no matter how many
+  times the costmaps are cleared, the car keeps trying (per the operator's
+  instruction) until the 2 minutes run out, then reports failure rather than
+  trying forever in silence.
+
+  REPLANNING IS CONTINUOUS (stock 1 Hz RateController, unconditional
+  ComputePathToPose).  For a while this tree held the path and only replanned
+  when it became blocked or 8 s had passed ("replan only when needed"), on the
+  theory that a fresh plan every second let the path chase the car's drift
+  instead of the car being made to steer back.  That was treating a symptom.
+  The drift itself had three concrete causes, all now fixed at the source
+  (see qcar2_slam_and_nav.yaml and nav2_qcar_command_convert.cpp): the
+  turning geometry was sized off a 0.60 rad steering limit the chassis does
+  not have, the steering-centre bias restarted from zero every launch, and
+  velocity_smoother's angular deadband was discarding every small
+  line-holding correction.  With those gone the car can actually track a
+  fresh plan, and holding a stale one is purely harmful: when a person steps
+  into the corridor the operator saw a new green route drawn but the car
+  torn between the old plan the controller still had and the new one, and it
+  crept along between the two.  One plan, always current, from the car's
+  actual pose, is what a dynamic-obstacle world needs, and is what the
+  operator explicitly asked for.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Timeout msec="120000" name="GiveUpAfter2MinutesOfRealEffort">
+    <RecoveryNode number_of_retries="100000" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="2.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <BackUp backup_dist="0.30" backup_speed="0.12"/>
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+    </Timeout>
+  </BehaviorTree>
+</root>

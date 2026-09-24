@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>qcar2_rviz_gui</name>
+  <version>0.1.0</version>
+  <description>
+    Custom RViz GUI, launch files and helper nodes for QCar2 SLAM + Nav2:
+    360-degree CSI camera view, LiDAR scan, live SLAM map, costmaps
+    (obstacle detection) and point-and-click navigation.
+  </description>
+  <maintainer email="nischaysai35@gmail.com">nvidia</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>qcar2_nodes</exec_depend>
+  <exec_depend>qcar2</exec_depend>
+  <exec_depend>cartographer_ros</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_common</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>image_transport</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>qcar2_interfaces</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>nav2_collision_monitor</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,7 @@
+<library path="qcar2_rviz_panels">
+  <class name="qcar2_rviz_panels/QCarControlPanel"
+         type="qcar2_rviz_panels::QCarControlPanel"
+         base_class_type="rviz_common::Panel">
+    <description>QCar2 control panel: 360-degree camera toggle and a modern RViz theme.</description>
+  </class>
+</library>

@@ -1,0 +1,745 @@
+
+amcl:
+  ros__parameters:
+    use_sim_time: False
+    alpha1: 0.2
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+    base_frame_id: "base_link"
+    global_frame_id: "map"
+    odom_frame_id: "odom"
+    scan_topic: "/scan"
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    min_particles: 300
+    max_particles: 1500
+    max_beams: 60
+    laser_min_range: 0.12
+    laser_max_range: 12.0
+    laser_likelihood_max_dist: 4.0
+    update_min_d: 0.05
+    update_min_a: 0.05
+    resample_interval: 1
+    transform_tolerance: 0.5
+    tf_broadcast: true
+    # Publish map -> odom immediately so RViz can render the saved map before
+    # the operator supplies the real initial pose. This is only a temporary
+    # display/localization seed; 2D Pose Estimate must be used after startup.
+    set_initial_pose: true
+    # MUST stay false.  When true, AMCL throws away its pose estimate and snaps
+    # back to the origin below every time the lifecycle re-activates (which
+    # happens on recovery / lifecycle bounces).  The operator's "2D Pose
+    # Estimate" was silently discarded, leaving map->odom wrong -- so a goal
+    # clicked on the map resolved to a completely different physical spot and
+    # the car drove off the planned path.
+    always_reset_initial_pose: false
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+
+# nav2_bringup's localization launch rewrites this existing key from its
+# map:= launch argument. Without it the map server starts with no YAML file
+# and /map remains empty even though the process itself is running.
+map_server:
+  ros__parameters:
+    use_sim_time: False
+    yaml_filename: ""
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: False
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    # 'default_nav_through_poses_bt_xml' and 'default_nav_to_pose_bt_xml' are use defaults:
+    # nav2_bt_navigator/navigate_to_pose_w_replanning_and_recovery.xml
+    # nav2_bt_navigator/navigate_through_poses_w_replanning_and_recovery.xml
+    # They can be set here or via a RewrittenYaml remap from a parent launch file to Nav2.
+    #
+    # navigate.launch.py rewrites this to the Ackermann tree in
+    # qcar2_rviz_gui/behavior_trees/, which drops the <Spin> and <BackUp>
+    # recoveries -- a QCar2 cannot rotate in place, and <BackUp> is what made
+    # the car reverse unexpectedly.  RewrittenYaml can only replace a key that
+    # already exists, which is why this is spelled out rather than left
+    # commented; the stock path below is the fallback if it is not rewritten.
+    default_nav_to_pose_bt_xml: "/opt/ros/humble/share/nav2_bt_navigator/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml"
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_smooth_path_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_assisted_teleop_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_truncate_path_local_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_path_expiring_timer_condition
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_goal_updated_controller_bt_node
+      - nav2_is_battery_low_condition_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_goal_checker_selector_bt_node
+      - nav2_controller_cancel_bt_node
+      - nav2_path_longer_on_approach_bt_node
+      - nav2_wait_cancel_bt_node
+      - nav2_spin_cancel_bt_node
+      - nav2_back_up_cancel_bt_node
+      - nav2_assisted_teleop_cancel_bt_node
+      - nav2_drive_on_heading_cancel_bt_node
+      - nav2_is_battery_charging_condition_bt_node
+
+bt_navigator_navigate_through_poses_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False
+
+bt_navigator_navigate_to_pose_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False
+
+controller_server:
+  ros__parameters:
+    # Match MPPI's 0.05 s model step. Running it at 100 Hz produced rapidly
+    # changing low-speed commands that the QCar drivetrain cannot follow.
+    controller_frequency: 20.0
+    # Was 0.30: right after a fresh "2D Pose Estimate" or goal click, AMCL's
+    # map->odom correction is still settling and the local costmap can arrive
+    # a little late. Too tight a timeout made the controller abort/retry
+    # unpredictably here -- sometimes it recovered in one BT tick (looked
+    # instant), sometimes it took several recovery cycles (looked like a long
+    # delay or a total stall). More slack smooths that out.
+    costmap_update_timeout: 0.50
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.1
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
+    controller_plugins: ["FollowPath"]
+    # Was true.  In Nav2 Humble the local costmap lives inside THIS process,
+    # and SCHED_FIFO on the MPPI control thread lets an over-budget
+    # optimisation preempt the costmap's update/inflate/publish thread.  That
+    # is the second half of the "LiDAR is instant but the red obstacle box
+    # lags" problem: /scan comes from the separate lidar node and was never
+    # affected, while everything downstream of it was queued behind MPPI.
+    use_realtime_priority: false
+
+    # Progress checker parameters
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.1
+      # Was 100.0 s -- that is why the car could sit against a wall doing
+      # nothing and never recover.  Nothing declares the car stuck until this
+      # expires, so no recovery (costmap clear, back up) could fire for a full
+      # minute and a half.  Then 10 s, which was still too patient in the case
+      # that actually matters: someone steps in close, MPPI's only
+      # obstacle-free option is to inch forward, and the car grinds at a crawl
+      # for the full allowance before anything decides it is stuck -- and,
+      # with the old RoundRobin order, burned a second allowance on clearing
+      # costmaps (useless against a person the LiDAR instantly re-marks)
+      # before finally backing up.  5 s.  This is not a cap on slow
+      # manoeuvring: SimpleProgressChecker RESETS this timer every time the
+      # car covers required_movement_radius above, so a genuine three-point
+      # manoeuvre keeps renewing it.  5 s of failing to move even 0.1 m is a
+      # real stall, and the answer to it is to back up and retry with room --
+      # which is now the first thing tried, see the RoundRobin in
+      # navigate_to_pose_ackermann.xml.
+      movement_time_allowance: 5.0
+    # Goal checker parameters
+    #precise_goal_checker:
+    #  plugin: "nav2_controller::SimpleGoalChecker"
+    #  xy_goal_tolerance: 0.25
+    #  yaw_goal_tolerance: 0.25
+    #  stateful: True
+    general_goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
+      # Was 0.25 m.  An Ackermann car cannot make fine positional corrections
+      # near the goal -- it has no sideways or in-place motion -- so a tight
+      # tolerance leaves it endlessly re-approaching, which is the looping the
+      # operator sees in the last 20 cm.  0.30 m is inside one car length and
+      # is comfortably achievable on the first approach.
+      xy_goal_tolerance: 0.30
+      # Was 0.25 rad, and that is what made the wheels twitch after arrival.
+      # SimpleGoalChecker only reports "goal reached" when position AND heading
+      # are both satisfied -- but a front-wheel-steered car cannot change its
+      # heading while stopped.  So on arrival the check never passed, the
+      # controller kept running forever, and GoalAngleCritic kept emitting tiny
+      # heading corrections.  Those became visible twitch because the converter
+      # derives steering as atan(L * wz / vx): at crawl speed that divides by a
+      # very small vx, so a near-zero wz flipping sign swings the wheels
+      # lock-to-lock.  3.2 rad (> pi) accepts any final heading, so the goal
+      # latches the moment the car is within 0.25 m and the controller stops
+      # commanding.  Final heading is not something this chassis can honour at
+      # a standstill anyway.
+      yaw_goal_tolerance: 3.2
+    FollowPath:
+      plugin: "nav2_mppi_controller::MPPIController"
+      # time_steps was 75 and batch_size was 2000 -- 150,000 trajectory points
+      # rolled out, scored and (with the old consider_footprint: true) footprint
+      # collision-checked, every 50 ms, on an ARM core.  That does not fit in
+      # the budget, and controller_server is the same process that owns the
+      # local costmap, so the overrun showed up as the obstacle boundary
+      # appearing late or not at all while the raw LiDAR points stayed fluid.
+      # Was 40 (2.0 s / ~0.9 m lookahead at vx_max).  That is not enough
+      # horizon to plan a full detour around a person standing in the
+      # corridor: a swerve-and-rejoin trajectory only scores well on
+      # PathAlignCritic once MPPI can see far enough ahead to sample the
+      # "back on the line after passing" part of the manoeuvre.  With only
+      # 0.9 m of rollout, every sampled swerve looked purely off-path with no
+      # visible payoff, so ObstaclesCritic's braking dominated and the car
+      # just stopped short instead of committing to the detour that
+      # ComputePathToPose had already drawn around the person.  56 steps
+      # gives 2.8 s / ~1.26 m at vx_max -- enough room to both clear a person
+      # standing in the corridor and see the rejoin -- while staying well
+      # under the 150,000-point-per-cycle budget that overran this ARM core
+      # before (56 steps x 1000 batch = 56,000 points, vs. the old 75 x 2000).
+      time_steps: 56
+      model_dt: 0.05
+      batch_size: 1000
+      # Was 0.36 (3x the original 0.12 m/s). Slight further bump per request;
+      # vx_std kept at the same ~42% fraction of vx_max so MPPI's velocity
+      # sampling noise scales with it.
+      vx_std: 0.19
+      vy_std: 0.2
+      # Raised from 0.2.  wz_std is how much MPPI's random exploration
+      # varies the yaw-rate control around its current mean each cycle. A
+      # goal that suddenly needs a sharp, close-in turn (set to the side, a
+      # short distance away) starts from a mean near 0 (it was likely
+      # driving roughly straight the moment before), and 0.2 rarely samples
+      # far enough from that mean to discover that committing to a much
+      # bigger wz actually scores better -- so it converges on a timid small
+      # angle and hunts around it instead, which is exactly the "jitters
+      # between 0 and 10 degrees" behaviour. 0.3 widens that exploration so
+      # a large corrective turn is actually in the sampled batch when one is
+      # needed, not just incrementally drifted toward over many cycles.
+      wz_std: 0.3
+      vx_max: 0.45
+      # Was 0.0, which meant MPPI could not even consider reversing no matter
+      # what the planner asked for.  Capped well below the forward limit: the
+      # car has no rear sensing beyond the 360 LiDAR, so reverse stays slow.
+      vx_min: -0.20
+      vy_max: 0.0
+      # MPPI's tightest achievable arc is vx_max / wz_max.  This was raised to
+      # 1.2 on the belief the chassis could turn at 0.256 / tan(0.60) = 0.374 m.
+      # That belief was wrong: the steering stop is 0.5236 rad (30 deg, from
+      # qcar2/urdf/QCar2.urdf hub joint limits), not 0.60, so the real minimum
+      # radius is 0.25725 / tan(0.5236) = 0.446 m.  At wz_max 1.2 the
+      # controller was routinely choosing 0.375 m arcs the car physically
+      # cannot make, ran wide on every one of them, and then chose an equally
+      # impossible correction -- which is what "it never steers enough" was.
+      # 1.0 gives 0.45 / 1.0 = 0.45 m: exactly what the chassis can do, no
+      # more.  Mirror any change here into velocity_smoother.max_velocity[2].
+      wz_max: 1.0
+      iteration_count: 1
+      # Was 7.5 m: MPPI kept almost the entire global path in its working set
+      # even though it can only reason 0.9 m ahead, which slowed every critic
+      # and made the "furthest reached point" tracking sluggish on turns.
+      prune_distance: 2.0
+      # Was 0.1: too tight given AMCL's map->odom correction settling time,
+      # see costmap_update_timeout above -- same variable-startup-delay cause.
+      transform_tolerance: 0.3
+      temperature: 0.3
+      gamma: 0.015
+      motion_model: "Ackermann"
+      visualize: false
+      regenerate_noises: true
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      AckermannConstraints:
+        # The chassis's TRUE minimum: wheelbase 0.25725 m at the 0.5236 rad
+        # mechanical steering stop gives 0.25725 / tan(0.5236) = 0.446 m.
+        # Was 0.38, derived from a 0.60 rad limit the linkage does not have.
+        # Still tighter than SmacPlannerHybrid's 0.55 m, so the controller can
+        # out-turn any curve the planner produces and has ~0.10 m of radius in
+        # hand to pull back onto the line -- but no longer asking for arcs the
+        # servo cannot deliver.
+        min_turning_r: 0.45
+      critics: [
+        "ConstraintCritic", "GoalCritic",
+        "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
+        "PathAngleCritic", "PreferForwardCritic", "ObstaclesCritic"]
+      # Score the trajectories against the live local costmap.  Without this
+      # critic, newly observed obstacles were drawn in RViz but were not part
+      # of MPPI's trajectory-cost calculation.
+      ObstaclesCritic:
+        enabled: true
+        cost_power: 1
+        # Was 4.0, raised to 6.0 to fix trajectories cutting back toward a
+        # passing obstacle too soon ("went around me but way too close").
+        # Brought back to 5.0 alongside inflation_radius above: at 6.0 it was
+        # also fighting tight, close-to-a-wall goal approaches, adding to the
+        # hesitant near-goal steering.  Still above the original 4.0.
+        repulsion_weight: 5.0
+        critical_weight: 80.0
+        # Was true, and this was the main reason the obstacle boundary lagged.
+        # consider_footprint rasterises the full robot polygon against the
+        # costmap for EVERY trajectory point -- with the old 2000 x 75 batch
+        # that is 150,000 polygon scans per control cycle, and it blew the
+        # 50 ms budget on this hardware.  With false, MPPI reads a single cell
+        # cost per point and relies on the inflation layer to represent the
+        # robot's extent, which is exactly what inflation is for.  The local
+        # costmap's inflation_radius (see local_costmap below) covers the
+        # 0.25 m circumscribed radius of this footprint plus a real
+        # clearance margin, so the safety margin is preserved rather than
+        # traded away.
+        consider_footprint: false
+        collision_cost: 10000.0
+        near_goal_distance: 0.5
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        # Raised from 5.0, and threshold widened from 1.4.  On a short,
+        # sharply-offset goal (set close by, well off to one side) this
+        # critic and PathAlignCritic below were fighting almost the whole
+        # way in: PathAlignCritic's exact-path-hugging pull (weight 20) was
+        # winning against a comparatively weak direct pull to the goal
+        # itself, so MPPI hedged toward small, indecisive steering angles
+        # instead of committing to the sharp turn the goal actually needs.
+        # A stronger, earlier-engaging goal pull tips that balance toward
+        # "get there," with PathAlignCritic's weight also trimmed below.
+        cost_weight: 7.0
+        threshold_to_consider: 1.6
+      GoalAngleCritic:
+        # Disabled deliberately.  This critic pushes the car to match the
+        # goal's final heading, which a car-like robot can only do by driving,
+        # not by pivoting.  Now that yaw_goal_tolerance accepts any heading, it
+        # has nothing left to achieve and its low-speed heading corrections
+        # were a direct contributor to the steering twitch on arrival.
+        enabled: false
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      PreferForwardCritic:
+        # Disabled now that the car is deliberately reversing-capable.  This
+        # critic penalises every reverse trajectory, so with Reeds-Shepp it
+        # fought the planner's own reverse segments and the car would stall
+        # rather than back up.  Direction preference is expressed in the
+        # planner instead, via reverse_penalty.
+        enabled: false
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        # Was 20.0 (itself raised from 14.0 for drift after replanning).
+        # Trimmed back down a step: at 20 it out-weighed GoalCritic badly
+        # enough on a short, sharply-offset goal that MPPI would rather
+        # nurse the exact planned curve than commit to the sharp turn
+        # actually needed, producing a timid 0-10 deg hunt instead of
+        # steering hard toward the goal.  16 still holds the line on normal
+        # open-path driving (this critic's original job) while leaving
+        # GoalCritic's now-stronger pull room to win a close-in maneuver.
+        cost_weight: 16.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        # Back to false now that Reeds-Shepp is in use.  On a REVERSE segment
+        # the path pose orientation is the vehicle heading, which points
+        # opposite to the direction of travel -- so matching orientations while
+        # also trying to hold the line gives this critic two conflicting jobs
+        # exactly when the car is reversing.  Purely positional alignment is
+        # direction-agnostic and unambiguous, and holding the line is all this
+        # critic is actually needed for.
+        use_path_orientations: false
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        # Was 1.0 rad.  This critic only engages once the path heading differs
+        # from the robot heading by more than this, and it then penalises the
+        # whole batch -- which is how a goal behind the car ended up with no
+        # acceptable trajectory at all.  Smac Hybrid now guarantees the path
+        # starts tangent to the car, so a large mismatch means the car is
+        # genuinely mid-manoeuvre and should be allowed to turn, not frozen.
+        max_angle_to_furthest: 1.6
+        # mode 1 = BIDIRECTIONAL, the documented setting for a robot that may
+        # legitimately travel in either direction.
+        #
+        # Mode 2 (CONSIDER_FEASIBLE_PATH_ORIENTATIONS) was right while the car
+        # was forward-only, but it asks the robot to MATCH the path pose
+        # heading.  On a Reeds-Shepp reverse segment the car is travelling
+        # opposite to the heading it must hold, so mode 2 penalised the very
+        # yaw rate needed to steer the back of the car toward the path -- the
+        # controller ended up commanding the opposite sense and the wheels went
+        # the wrong way.  Mode 1 drops the facing requirement and judges the
+        # angle without a forward preference, which is what reversing needs.
+        mode: 1
+      # TwirlingCritic:
+      #   enabled: true
+      #   twirling_cost_power: 1
+      #   twirling_cost_weight: 10.0
+
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      # Clearing only happens once per update cycle, so this rate is what
+      # makes a walking person's old footprints disappear promptly.
+      update_frequency: 10.0
+      # Was 5.0: the costmap recomputed at 10 Hz internally but only sent
+      # that fresher grid to RViz/MPPI half the time, adding up to 200 ms of
+      # pure display/consumption lag on top of whatever the network/render
+      # pipeline already costs. Publish every cycle it's recomputed.
+      publish_frequency: 10.0
+      global_frame: odom
+      robot_base_frame: base_link
+      use_sim_time: False
+      rolling_window: true
+      width: 6
+      height: 6
+      resolution: 0.05
+      footprint: "[[0.22, 0.12], [0.22, -0.12], [-0.21, -0.12], [-0.21, 0.12]]"
+      plugins: ["obstacle_layer", "inflation_layer"]
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # Lowered from 2.0 to match the global costmap's 1.5.  A higher
+        # scaling factor makes cost decay to zero sharply right at the
+        # inflation_radius edge, so MPPI's ObstaclesCritic only "feels" a
+        # dynamic obstacle once the car is nearly on top of it -- which is
+        # why a person walking in was only reacted to at close range.  1.5
+        # spreads the cost gradient out more gradually, so trajectories
+        # passing well outside the robot's own footprint already pick up
+        # some cost and MPPI starts curving away earlier, not just when the
+        # collision-radius boundary is reached.
+        cost_scaling_factor: 1.5
+        # THIS is the halo drawn around the live LiDAR returns (the cyan
+        # points) near the car -- the global costmap's inflation only shows
+        # around mapped walls.  0.22 -> 0.60 -> 0.50 -> 0.30 -> 0.25 m, the
+        # last steps at the operator's explicit request for a thinner band.
+        #
+        # 0.25 sits a hair UNDER this footprint's circumscribed radius,
+        # sqrt(0.22^2 + 0.12^2) = 0.2506 m.  Consequences, deliberately
+        # accepted: (1) ObstaclesCritic logs its "inflation is not set
+        # sufficiently for optimized non-circular collision checking" warning
+        # once at startup -- harmless, it only affects the footprint-check
+        # shortcut and consider_footprint is false here anyway; (2) this band
+        # IS the clearance the car keeps, and at 0.25 m none of it extends
+        # past the car's own corners, so MPPI only reacts to an obstacle once
+        # a corner is about to reach it.  Collision detection itself is
+        # unaffected (inCollision() keys on the lethal/inscribed cost values,
+        # not on the radius).  If "passes way too close" comes back, this and
+        # FollowPath.ObstaclesCritic.repulsion_weight are the pair to raise
+        # together.  The visible thickness cannot be thinned separately from
+        # the margin via cost_scaling_factor: at any usable factor the cost
+        # stays >= 1 out to the full radius, so the band always draws to it.
+        inflation_radius: 0.25
+      # A 2D LiDAR cannot fill a 3D voxel grid, so the VoxelLayer that used to
+      # be here could mark a cell but never gather enough evidence to clear it
+      # again -- that is what left a trail of "ghost" footprints behind moving
+      # people.  ObstacleLayer is the correct 2D counterpart and clears a cell
+      # as soon as a single ray passes through it.
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          observation_persistence: 0.1
+          # raytrace range MUST exceed the marking range.  When both were 5.0
+          # a cell marked near the 5 m edge could never be cleared, because the
+          # clearing ray stopped at exactly the same distance.
+          obstacle_max_range: 6.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 12.0
+          raytrace_min_range: 0.0
+          inf_is_valid: true
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      always_send_full_costmap: True
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      # The global costmap is not a rolling window: anything marked here stays
+      # until a ray clears it.  At 1 Hz that clearing lagged far behind a
+      # walking person, which is why old footprints stayed visible on the map.
+      # Raised again from 3.0: RViz's Map display only redraws when a new
+      # message lands, and the ~330ms gap between publishes at 3 Hz was
+      # showing up as the obstacle border flickering in/out on screen.
+      update_frequency: 5.0
+      publish_frequency: 5.0
+      global_frame: map
+      robot_base_frame: base_link
+      use_sim_time: False
+      footprint: "[[0.22, 0.12], [0.22, -0.12], [-0.21, -0.12], [-0.21, 0.12]]"
+      resolution: 0.05
+      track_unknown_space: true
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          observation_persistence: 0.1
+          # Same rule as the local costmap: clear further than we mark, so a
+          # cell can always be raytraced free again once the object leaves.
+          obstacle_max_range: 6.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 12.0
+          raytrace_min_range: 0.0
+          # Treat max-range returns as valid free space rather than discarding
+          # them; without this, "nothing there" never clears the old mark.
+          inf_is_valid: true
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 1.5
+        # This is the halo actually visible across the WHOLE map in the web
+        # console -- the local costmap's inflation (see local_costmap above)
+        # only covers a 6x6 m rolling window around the robot, so it can't
+        # be what shows up thick around walls far from the car.  0.35 -> 0.28
+        # -> 0.15 m, deliberately BELOW the footprint's circumscribed radius
+        # (sqrt(0.22^2+0.12^2) = 0.2506 m).  That floor genuinely matters for
+        # the LOCAL costmap, because MPPI's ObstaclesCritic reads that one
+        # with consider_footprint:false and so leans on inflation to stand in
+        # for the robot's extent.  It does NOT matter here: this costmap only
+        # feeds SmacPlannerHybrid's global path and the console's rendering.
+        # Real clearance around obstacles is still enforced by the local
+        # costmap's 0.50 m inflation plus ObstaclesCritic, which is what the
+        # car actually drives on.  The only practical effect of going this
+        # thin is that the GLOBAL path may be drawn closer to walls; the
+        # local planner still refuses to follow it in that closely.
+        inflation_radius: 0.15
+      always_send_full_costmap: True
+
+map_saver:
+  ros__parameters:
+    use_sim_time: False
+    save_map_timeout: 5.0
+    free_thresh_default: 0.25
+    occupied_thresh_default: 0.65
+    map_subscribe_transient_local: True
+
+planner_server:
+  ros__parameters:
+    # Hybrid-A* costs far more per plan than NavFn, and the behavior tree only
+    # asks for a new plan at 1 Hz (RateController hz="1.0").  Leaving this at
+    # 20.0 just spammed "planner loop missed its desired rate" every cycle.
+    expected_planner_frequency: 1.0
+    planner_plugins: ["GridBased"]
+    costmap_update_timeout: 1.0
+    GridBased:
+      # WAS nav2_navfn_planner/NavfnPlanner -- and that was the root cause of
+      # "a goal behind the car makes it sit still".
+      #
+      # NavFn is a holonomic grid search: it treats the robot as a point that
+      # may move in any direction, so for a goal behind the car it returns a
+      # path that sets off straight backwards from the robot's nose.  A
+      # front-wheel-steered car cannot follow that path at all.  MPPI then
+      # scored every forward sample against it: PathAngleCritic penalised the
+      # whole batch (the path heading was ~180 deg from the car heading, way
+      # past max_angle_to_furthest), PathAlignCritic at weight 14.0 pulled
+      # toward a line the chassis cannot reach, and reverse was not even
+      # sampled (vx_min: 0.0).  The winning trajectory was therefore "barely
+      # move", which velocity_smoother's deadband_velocity then snapped to
+      # exactly zero -- no motion, no error, just a parked car.  A goal off to
+      # the side is the same failure in milder form (~90 deg of mismatch
+      # instead of ~180), which is exactly why side goals started sluggishly
+      # while goals dead ahead worked perfectly.
+      #
+      # Smac Hybrid-A* searches in (x, y, heading) and expands only Dubins
+      # motion primitives that honour minimum_turning_radius, so every path it
+      # returns is one this chassis can actually drive.  For a goal behind the
+      # car it plans the forward loop / U-turn instead of an impossible pivot,
+      # and the path already leaves the robot's nose pointing the right way, so
+      # MPPI's critics agree with it from the first tick.
+      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+      tolerance: 0.25
+      downsample_costmap: false
+      downsampling_factor: 1
+      allow_unknown: true
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      # REEDS_SHEPP = forward AND reverse primitives.  Reverse is now enabled
+      # end to end (FollowPath vx_min, velocity_smoother min_velocity, and the
+      # <BackUp> recovery), so the planner is free to use it.  For a goal
+      # behind the car this returns a straight reverse instead of the forward
+      # loop DUBIN was forced into.  reverse_penalty below keeps it a last
+      # resort rather than a habit.
+      motion_model_for_search: "REEDS_SHEPP"
+      angle_quantization_bins: 72
+      analytic_expansion_ratio: 3.5
+      analytic_expansion_max_length: 3.0
+      # The chassis itself can manage 0.256 / tan(0.60) = 0.374 m, but the
+      # binding limit is the CONTROLLER: MPPI can only realise vx_max / wz_max
+      # = 0.45 / 1.0 = 0.45 m.  Planning turns tighter than the controller can
+      # execute is what made the car drift off its own path, so this stays
+      # comfortably above that at 0.55 m -- every curve the planner emits is
+      # then one MPPI can actually track, with margin.
+      minimum_turning_radius: 0.55
+      reverse_penalty: 2.0
+      change_penalty: 0.0
+      non_straight_penalty: 1.2
+      cost_penalty: 2.0
+      retrospective_penalty: 0.015
+      # 20.0 m built a 401x401 Dubins heuristic table and cost ~2.4 s of
+      # startup.  This map is only ~8.3 x 5.7 m, so 12 m already exceeds its
+      # diagonal; anything beyond that is table that can never be indexed.
+      lookup_table_size: 12.0
+      # The obstacle heuristic cache is only valid while the costmap is static.
+      # This one has a live obstacle_layer tracking people walking through it,
+      # so caching would plan around obstacles that have already moved away.
+      cache_obstacle_heuristic: false
+      smooth_path: true
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+        do_refinement: true
+        refinement_num: 2
+
+smoother_server:
+  ros__parameters:
+    use_sim_time: False
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: True
+
+behavior_server:
+  ros__parameters:
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors/DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+    assisted_teleop:
+      plugin: "nav2_behaviors/AssistedTeleop"
+    global_frame: odom
+    robot_base_frame: base_link
+    # Was 0.1, same reason as controller_server's transform_tolerance/
+    # costmap_update_timeout above -- give AMCL's map->odom correction room
+    # to settle instead of the behavior server bailing on a stale transform.
+    transform_tolerance: 0.3
+    use_sim_time: False
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 1.0  #1.0
+    min_rotational_vel: 0.4 #0.4
+    rotational_acc_lim: 3.2
+
+robot_state_publisher:
+  ros__parameters:
+    use_sim_time: False
+
+waypoint_follower:
+  ros__parameters:
+    loop_rate: 20
+    stop_on_failure: false
+    action_server_result_timeout: 900.0
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: True
+      waypoint_pause_duration: 200
+
+velocity_smoother:
+  ros__parameters:
+    smoothing_frequency: 20.0
+    scale_velocities: False
+    feedback: "OPEN_LOOP"
+    # Linear x scaled to match FollowPath's vx_max above (was 0.36; matches
+    # the slight increase there). max_accel/decel scaled by the same ~1.25x
+    # factor so the ramp-up/ramp-down time is unchanged (was already tuned)
+    # instead of taking longer to reach top speed.
+    # angular.z MUST equal FollowPath's wz_max: this node is the last thing
+    # to touch the command before the converter turns it into a steering
+    # angle, and it clips silently.  1.0 rad/s at 0.45 m/s is
+    # atan(L*wz/v) = 29.7 deg -- the car's full 30 deg of steering, no more.
+    max_velocity: [0.45, 0.0, 1.0]
+    # linear.x was 0.0, which silently clamped every reverse command from the
+    # controller to zero -- the single hard block on reversing.  Matches
+    # FollowPath's vx_min.
+    min_velocity: [-0.20, 0.0, -1.0]
+    # Angular acceleration was 1.0 rad/s^2, and that was the real reason the
+    # car "would not steer enough".  Swinging the yaw command from one lock to
+    # the other spans 2.4 rad/s, so at 1.0 rad/s^2 it took nearly two and a
+    # half SECONDS -- the car had driven past the corner before the command
+    # arrived, and every correction needed several shuffling attempts.  The
+    # steering rack itself covers full lock in 150 ms
+    # (kMaxSteeringRateRadPerSec), so this was the binding constraint by a
+    # factor of about seven.  4.0 rad/s^2 lets the rack be the limit instead.
+    max_accel: [1.1, 0.0, 4.0]
+    max_decel: [-1.5, 0.0, -4.0]
+    odom_topic: "/odom"
+    odom_duration: 0.1
+    # Was [0,0,0]. At the very start of a move, FollowPath/MPPI's sampled
+    # velocity can dither in and out of the hardware's own ~0.03 PWM motor
+    # deadband (qcar2_hardware.cpp) a few times before committing to a real
+    # speed -- that's the wheel jitter on start. Snapping anything under
+    # this to zero keeps sub-deadband noise from ever reaching the motors.
+    #
+    # angular.z was 0.05 rad/s, and that is a STEERING deadband in disguise:
+    # at 0.45 m/s, 0.05 rad/s is atan(L*wz/v) = 1.6 deg of steering, so every
+    # correction smaller than that was thrown away.  Holding a straight line
+    # is made almost entirely of corrections smaller than that, which is why
+    # the car wandered off a straight and never nudged itself back.  0.01
+    # rad/s (0.3 deg) still swallows sensor-level noise.
+    deadband_velocity: [0.03, 0.0, 0.01]
+    velocity_timeout: 0.5

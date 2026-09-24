@@ -1,0 +1,1228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QCar2 Console</title>
+<style>
+  /* White chrome everywhere except the map/3D viewport, which stays a dark
+     "instrument" surface -- that split is deliberate: it is the one part of
+     the screen showing rendered 3D content and live camera video, and a
+     light background behind those reads as washed-out and hurts contrast on
+     the costmap colours.  --vp-* tokens are that viewport's own fixed dark
+     palette, used only inside #viewwrap; nothing else references them.
+     Mapping and navigation share the shell but get their own accent so a
+     glance at the screen tells you which mode the car is in. */
+  :root {
+    --bg: #eef1f5; --panel: #ffffff; --panel-2: #ffffff; --panel-3: #f2f5f8;
+    --line: #dde3ea; --line-soft: #e7ebf0;
+    --text: #16202c; --muted: #64748b;
+    --accent: #0e9488; --accent-ink: #ffffff; --accent-soft: rgba(14,148,136,.10);
+    --warn: #b8650c; --stop: #e0293f; --ok: #1f9d55; --goal: #b8650c;
+    --sidebar-width: 348px;
+    --ui-scale: 1;
+
+    --vp-bg: #060a12; --vp-panel: #0e1726; --vp-line: #223350;
+    --vp-text: #e8f0fa; --vp-muted: #8fa3bd;
+  }
+  /* Mode accents: teal for mapping (building something), blue for driving. */
+  body[data-mode="mapping"] { --accent: #0e9488; --accent-ink: #ffffff; --accent-soft: rgba(14,148,136,.10); }
+  body[data-mode="navigation"] { --accent: #1c6fd6; --accent-ink: #ffffff; --accent-soft: rgba(28,111,214,.10); }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased; overflow: hidden; }
+  .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+
+  button { font: inherit; color: var(--text); cursor: pointer; border: 1px solid var(--line);
+    background: var(--panel-2); border-radius: 9px; padding: 8px 12px; font-weight: 600;
+    transition: background .14s, border-color .14s, color .14s; }
+  button:hover { background: var(--panel-3); border-color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  button.active { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  button.stop { background: var(--stop); border-color: var(--stop); color: #fff; font-size: 14px; padding: 13px; letter-spacing: .4px; }
+  button.stop.active { background: var(--ok); border-color: var(--ok); color: #fff; }
+  button.warn { background: transparent; border-color: var(--warn); color: var(--warn); }
+  button.warn:hover { background: var(--warn); color: #fff; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  input[type=range] { width: 100%; accent-color: var(--accent); background: transparent; }
+  input[type=text] { background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; width: 100%; font: inherit; }
+  input[type=text]:focus { outline: none; border-color: var(--accent); }
+
+  /* Explicit grid-row/-column on every direct child of #app, not just
+     grid-template-rows/-columns: with only header/viewwrap/aside, CSS
+     grid's auto-placement algorithm happened to land them right, but
+     #warnBar is a 4th child with no placement of its own. Auto-placement
+     then shoved it into row 2 col 1 (viewwrap's cell), bumped viewwrap
+     into col 2 (aside's cell), and dropped aside into a new implicit
+     row 3 with no height -- which is exactly the "banner appears and the
+     whole layout scrambles" bug. Naming every cell removes the ambiguity
+     regardless of how many children #app ends up with. */
+  #app { display: grid; grid-template-rows: 50px auto 1fr; grid-template-columns: minmax(0,1fr) var(--sidebar-width); height: 100%; }
+
+  header { grid-row: 1; grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; padding: 0 14px;
+    background: var(--panel); border-bottom: 1px solid var(--line); box-shadow: 0 1px 0 rgba(16,32,48,.03); }
+  .brand { font-weight: 800; letter-spacing: 2px; font-size: 15px; color: var(--accent); }
+  .pill { padding: 3px 10px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line);
+    color: var(--muted); font-size: 10.5px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; }
+  .pill.mode { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--stop); display: inline-block; margin-right: 6px; vertical-align: middle; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 7px var(--ok); }
+  header .spacer { flex: 1; }
+  .stat { color: var(--muted); font-size: 12px; }
+  .stat b { color: var(--text); font-weight: 700; font-size: 13.5px; }
+
+  /* Everything below is INSIDE #viewwrap: the one part of the page that
+     keeps a fixed dark palette (--vp-*) regardless of the chrome theme, so
+     text stays legible over the map/3D scene and camera video. */
+  #viewwrap { grid-row: 3; grid-column: 1; position: relative; overflow: hidden; background: var(--vp-bg); color: var(--vp-text); }
+  #view { position: absolute; inset: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #threeCanvas { display: none; }
+  body.is3d #canvas { display: none; }
+  body.is3d #threeCanvas { display: block; }
+  #view.pose canvas, #view.goal canvas { cursor: crosshair; }
+  #view.move canvas { cursor: grab; }
+  #resizeHandle { position: absolute; z-index: 6; top: 0; right: 0; width: 8px; height: 100%; cursor: col-resize; }
+  #resizeHandle:hover, #resizeHandle.dragging { background: rgba(55,216,196,.25); }
+
+  .toolbar { position: absolute; top: 12px; left: 12px; display: flex; gap: 5px; z-index: 3; flex-wrap: wrap;
+    background: rgba(14,23,38,.9); backdrop-filter: blur(8px); padding: 6px; border-radius: 11px; border: 1px solid var(--vp-line); }
+  .toolbar button { padding: 7px 11px; font-size: 12px; background: #131f33; border-color: var(--vp-line); color: var(--vp-text); }
+  .toolbar button:hover { background: #1a2a42; border-color: #37d8c4; }
+  .toolbar button.active { background: #37d8c4; border-color: #37d8c4; color: #052e2a; }
+  .toolbar .sep { width: 1px; background: var(--vp-line); margin: 3px 2px; }
+
+  .layers { position: absolute; top: 12px; right: 12px; z-index: 3; display: flex; flex-direction: column; gap: 4px;
+    background: rgba(14,23,38,.9); backdrop-filter: blur(8px); padding: 8px 10px; border-radius: 11px; border: 1px solid var(--vp-line); }
+  .layers .t { font-size: 9.5px; letter-spacing: 1.1px; color: var(--vp-muted); font-weight: 700; margin-bottom: 2px; }
+  .layers label { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--vp-muted); cursor: pointer; }
+  .layers label:hover { color: var(--vp-text); }
+  .layers input { accent-color: #37d8c4; margin: 0; }
+  .swatch { width: 9px; height: 9px; border-radius: 2px; }
+
+  .hud { position: absolute; left: 12px; bottom: 12px; z-index: 3; display: flex; flex-direction: column; gap: 7px; pointer-events: none; }
+  .banner { font-size: 23px; font-weight: 800; letter-spacing: 1px; padding: 7px 15px; border-radius: 11px;
+    background: rgba(14,23,38,.94); border: 1px solid var(--vp-line); color: var(--warn); display: none; }
+  .banner.show { display: inline-block; }
+  .telemetry { background: rgba(14,23,38,.94); border: 1px solid var(--vp-line); border-radius: 11px; padding: 9px 13px; font-size: 13px; color: var(--vp-text); }
+  .telemetry b { color: #37d8c4; font-weight: 800; font-size: 19px; }
+
+  /* Sticky diagnostic warnings: stay up for as long as the backend condition
+     that raised them holds, unlike #toasts which auto-dismiss. */
+  #warnBar { grid-row: 2; grid-column: 1 / -1; display: flex; flex-direction: column; }
+  #warnBar:empty { display: none; }
+  #warnBar .warnRow { background: rgba(64,20,10,.96); border-bottom: 1px solid #ff8a3d;
+    color: #ffb454; font-size: 14px; font-weight: 700; padding: 9px 16px; text-align: center; }
+  .telemetry .sub { color: var(--vp-muted); font-size: 11.5px; margin-top: 3px; }
+  .hint { position: absolute; top: 62px; left: 12px; z-index: 3; color: #37d8c4; font-size: 12px; font-weight: 600;
+    background: rgba(14,23,38,.92); border: 1px solid #37d8c4; padding: 5px 11px; border-radius: 9px; display: none; }
+  .hint.show { display: block; }
+
+  /* Sidebar is two stacked panels, not one scrolling list: the controls you
+     touch every second (drive pad / nav limits, e-stop) stay fixed on
+     screen; everything else (cameras, voice, save map) scrolls underneath
+     so it never pushes the controls out of reach. */
+  aside { grid-row: 3; grid-column: 2; background: var(--bg); border-left: 1px solid var(--line); display: flex; flex-direction: column; overflow: hidden; }
+  /* Height is set in px by JS (default 1/3 of the sidebar, draggable via
+     #vResizeHandle, persisted in localStorage) so it can be resized like the
+     sidebar's own width handle. */
+  .panel-fixed { flex: 0 0 auto; height: 33%; min-height: 120px; padding: 8px; display: flex; flex-direction: column; gap: 6px;
+    background: var(--panel); overflow: hidden; position: relative; z-index: 1; }
+  #vResizeHandle { flex: 0 0 auto; height: 9px; cursor: row-resize; position: relative; background: var(--panel);
+    border-bottom: 1px solid var(--line); box-shadow: 0 4px 10px rgba(16,32,48,.04); }
+  #vResizeHandle::after { content: ""; position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    width: 34px; height: 3px; border-radius: 2px; background: var(--line); }
+  #vResizeHandle:hover, #vResizeHandle.dragging { background: var(--accent-soft); }
+  #vResizeHandle:hover::after, #vResizeHandle.dragging::after { background: var(--accent); }
+  .panel-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+  .panel-scroll::-webkit-scrollbar { width: 9px; }
+  .panel-scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 5px; }
+  .card { background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: 12px; padding: 12px;
+    box-shadow: 0 1px 2px rgba(16,32,48,.04); }
+  .card.compact { padding: 8px 10px; border-radius: 10px; }
+  .card.compact h3 { margin-bottom: 5px; font-size: 9.5px; }
+  /* The Drive pad is the only thing in panel-fixed besides Emergency Stop
+     now (Navigation limits moved to the scrollable panel below -- it isn't
+     a touch-every-second control the way these two are).  Drive pad grows
+     to soak up whatever room panelFixed has; Emergency Stop takes only what
+     it needs, so it's always pinned at the bottom in full instead of
+     floating mid-panel above dead space or getting clipped when the fixed
+     panel's height is short. */
+  .panel-fixed #drivePadCard {
+    flex: 1 1 auto; display: flex; flex-direction: column; justify-content: center; }
+  .panel-fixed .card.compact:not(#drivePadCard) { flex: 0 0 auto; }
+
+  /* Drive pad + speed/steer sliders side by side.  The pad gets real button
+     size (it's what you actually click); the sliders are a fixed, modest
+     width instead of stretching to fill the leftover row -- that stretch
+     was what made them look oversized. Label sits above each slider so the
+     row doesn't need a separate label column eating into that width. */
+  /* Everything in the fixed panel is sized off --ui-scale, which JS recomputes
+     from the panel's actual width AND height (see updateUiScale()).  Dragging
+     either resize handle therefore genuinely resizes these controls instead of
+     just clipping them. */
+  .drive-row { display: flex; gap: calc(10px * var(--ui-scale)); align-items: center; }
+  .pad.small { grid-template-columns: repeat(3,1fr); gap: calc(4px * var(--ui-scale));
+    flex: 1 1 auto; min-width: 0; max-width: calc(168px * var(--ui-scale)); }
+  .pad.small button { padding: 0; height: calc(34px * var(--ui-scale));
+    font-size: calc(15px * var(--ui-scale)); border-radius: calc(7px * var(--ui-scale)); }
+  .slider-stack { flex: 1 1 auto; min-width: 0; max-width: calc(150px * var(--ui-scale));
+    display: flex; flex-direction: column; justify-content: center; gap: calc(9px * var(--ui-scale)); }
+  .ctrl { min-width: 0; }
+  .ctrl-label { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 3px; }
+  .ctrl-label span { color: var(--muted); font-size: calc(9.5px * var(--ui-scale)); font-weight: 700; letter-spacing: .4px; text-transform: uppercase; }
+  .ctrl-label b { color: var(--accent); font-size: calc(11.5px * var(--ui-scale)); }
+  .ctrl input[type=range] { display: block; width: 100%; }
+  .panel-fixed .card.compact { padding: calc(8px * var(--ui-scale)) calc(10px * var(--ui-scale)); }
+  .panel-fixed button.stop { font-size: calc(14px * var(--ui-scale)); padding: calc(13px * var(--ui-scale)); }
+  .panel-fixed .micro { font-size: calc(10px * var(--ui-scale)); }
+  .micro { font-size: 10px; margin-top: 2px; }
+  .micro kbd { padding: 0 3px; font-size: 9px; }
+  .card h3 { margin: 0 0 9px; font-size: 10px; letter-spacing: 1.3px; text-transform: uppercase; color: var(--muted);
+    display: flex; justify-content: space-between; align-items: center; font-weight: 700; }
+  .card h3 span { color: var(--accent); }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row > * { flex: 1; }
+  .value { color: var(--accent); font-weight: 800; font-size: 15px; text-align: center; margin: 1px 0 3px; }
+  .muted { color: var(--muted); font-size: 11.5px; }
+
+  .cams-wrap { position: relative; }
+  .cams { display: grid; grid-template-columns: 1fr; gap: 4px; }
+  .cams.grid { grid-template-columns: 1fr 1fr; }
+  .cams img { width: 100%; aspect-ratio: 4/3; object-fit: cover; background: #000; border-radius: 7px; border: 1px solid var(--line-soft); display: block; }
+  .cams .side { display: none; }
+  .cams.grid .side { display: block; }
+  /* The side cameras take 2-3 s to open (Quanser driver + first frames), so
+     the grid would otherwise sit there as three black boxes looking broken. */
+  .cams-loading { position: absolute; inset: 0; display: none; flex-direction: column; align-items: center;
+    justify-content: center; gap: 9px; border-radius: 7px; background: rgba(255,255,255,.88);
+    color: var(--muted); font-size: 11.5px; font-weight: 600; }
+  .cams-loading.show { display: flex; }
+  .spinner { width: 24px; height: 24px; border: 3px solid var(--line); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .fps { color: var(--muted); font-weight: 600; font-size: 10px; margin-left: 5px; }
+
+  .pad { display: grid; grid-template-columns: repeat(3,1fr); gap: 5px; }
+  .pad button { padding: 15px 0; font-size: 17px; user-select: none; touch-action: none; }
+  .pad button.held { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+
+  #toasts { position: absolute; left: 50%; transform: translateX(-50%); top: 62px; z-index: 7; display: flex; flex-direction: column; gap: 6px; align-items: center; }
+  .toast { background: #131f33; color: var(--vp-text); border: 1px solid var(--vp-line); border-left: 4px solid #37d8c4;
+    padding: 9px 14px; border-radius: 9px; animation: fade 4s forwards; box-shadow: 0 8px 26px rgba(0,0,0,.5); }
+  .toast.warn { border-left-color: #ffb454; } .toast.error { border-left-color: #ff5a6a; }
+  @keyframes fade { 0%,80% { opacity: 1 } 100% { opacity: 0 } }
+  kbd { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-size: 10.5px; font-family: inherit; }
+  /* Mode gating: one attribute on <body> decides what exists. */
+  .navonly, .maponly { display: none; }
+  body[data-mode="navigation"] .navonly { display: block; }
+  body[data-mode="mapping"] .maponly { display: block; }
+  body[data-mode="navigation"] button.navonly { display: inline-block; }
+  body[data-mode="navigation"] label.navonly { display: flex; }
+</style>
+</head>
+<body data-mode="navigation">
+<div id="app">
+  <header>
+    <span class="brand">QCAR2</span>
+    <span class="pill mode" id="modePill">—</span>
+    <span class="pill"><span class="dot" id="connDot"></span><span id="connText">connecting</span></span>
+    <span class="spacer"></span>
+    <span class="stat">Battery <b class="num" id="battery">—</b></span>
+    <span class="stat">Speed <b class="num" id="speed">0.00</b> m/s</span>
+    <span class="stat">Steer <b id="steer">CENTRE</b></span>
+  </header>
+  <div id="warnBar"></div>
+
+  <div id="viewwrap">
+    <div id="view" class="move">
+      <canvas id="canvas"></canvas>
+      <canvas id="threeCanvas"></canvas>
+    </div>
+    <div id="resizeHandle" title="Drag to resize the control panel"></div>
+
+    <div class="toolbar">
+      <button id="toolMove" class="active" title="Drag to pan, wheel to zoom">Move</button>
+      <button id="toolPose" title="Click where the car is, drag toward its heading">Set Pose</button>
+      <button id="toolGoal" class="navonly" title="Click the goal, drag for heading">Set Goal</button>
+      <button id="toolCancel" class="navonly" style="display:none">Cancel</button>
+      <div class="sep"></div>
+      <button id="toolFollow" class="active" title="Keep the camera centred on the car">Follow</button>
+      <button id="tool3d" title="Switch between top-down 2D and orbiting 3D">3D</button>
+      <button id="toolFit" title="Fit the whole map on screen">Fit</button>
+      <button id="toolFull" title="Fullscreen (F)">⛶</button>
+    </div>
+
+    <div class="layers">
+      <div class="t">LAYERS</div>
+      <label><input type="checkbox" id="lyMap" checked><span class="swatch" style="background:#9fb4c9"></span>Map</label>
+      <label class="navonly"><input type="checkbox" id="lyGcost" checked><span class="swatch" style="background:#4b6cff"></span>Global costmap</label>
+      <label class="navonly"><input type="checkbox" id="lyLcost" checked><span class="swatch" style="background:#ff4fa0"></span>Local costmap</label>
+      <label><input type="checkbox" id="lyScan" checked><span class="swatch" style="background:#00e1ff"></span>LiDAR</label>
+      <label class="navonly"><input type="checkbox" id="lyPlan" checked><span class="swatch" style="background:#00ff88"></span>Path</label>
+    </div>
+
+    <div class="hint" id="hint"></div>
+    <div class="hud">
+      <div class="banner" id="banner"></div>
+      <div class="telemetry" id="telemetry"><b>STOPPED</b></div>
+    </div>
+    <div id="toasts"></div>
+  </div>
+
+  <aside>
+    <!-- Fixed: the controls that need to stay under your hand while driving.
+         Defaults to 1/3 of the sidebar; drag #vResizeHandle to resize. -->
+    <div class="panel-fixed" id="panelFixed">
+      <!-- Identical card in both modes -- one component, not a mapping
+           version and a separate navigation version.  In navigation mode:
+           holding a button is a manual OVERRIDE that takes control away
+           from Nav2 immediately (for "about to hit something, grab it now"
+           moments); releasing hands control straight back to Nav2's goal
+           from wherever the car ended up, since the goal itself is never
+           cancelled -- see set_drive() in qcar2_web_gui.py and the
+           manual-override handling in nav2_qcar_command_convert.cpp.  The
+           Speed/Steer sliders do double duty there: besides being the
+           manual-override values above, on release they ALSO become Nav2's
+           own autonomous speed/steering limit -- see the driveSpeed/
+           driveSteer onchange handlers below.  One pair of sliders, not a
+           second "Navigation limits" card repeating the same two knobs. -->
+      <div class="card compact" id="drivePadCard">
+        <h3>Drive <span id="driveState">idle</span></h3>
+        <div class="drive-row">
+          <div class="pad small">
+            <button data-c="forward,left">↖</button><button data-c="forward">▲</button><button data-c="forward,right">↗</button>
+            <button data-c="left">◀</button><button id="driveStop">●</button><button data-c="right">▶</button>
+            <button data-c="reverse,left">↙</button><button data-c="reverse">▼</button><button data-c="reverse,right">↘</button>
+          </div>
+          <div class="slider-stack">
+            <div class="ctrl" title="Drive speed">
+              <div class="ctrl-label"><span>Speed</span><b class="num" id="driveSpeedText">0.40</b></div>
+              <input type="range" id="driveSpeed" min="0.05" max="0.55" step="0.01" value="0.40">
+            </div>
+            <div class="ctrl" title="Steering angle">
+              <div class="ctrl-label"><span>Steer</span><b class="num" id="driveSteerText">0.45</b></div>
+              <input type="range" id="driveSteer" min="0.05" max="0.52" step="0.01" value="0.45">
+            </div>
+          </div>
+        </div>
+        <div class="muted micro maponly">Hold to drive · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> <kbd>Space</kbd>=stop</div>
+        <div class="muted micro navonly">Overrides Nav2 while held, and sets its speed/steer limit · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></div>
+      </div>
+
+      <div class="card compact">
+        <button class="stop" id="estop" style="width:100%" title="Motion only. LiDAR and all nodes keep running.">EMERGENCY STOP</button>
+      </div>
+    </div>
+    <div id="vResizeHandle" title="Drag to resize"></div>
+
+    <!-- Scrollable: everything else. -->
+    <div class="panel-scroll">
+      <div class="card">
+        <h3>Cameras <span><span id="camState">front</span> <span id="camFps" class="fps"></span></span></h3>
+        <div class="cams-wrap">
+          <div class="cams" id="cams">
+            <img id="camFront" alt="front">
+            <img class="side" id="camRear" alt="rear">
+            <img class="side" id="camLeft" alt="left">
+            <img class="side" id="camRight" alt="right">
+          </div>
+          <div class="cams-loading" id="camsLoading"><div class="spinner"></div>Starting cameras…</div>
+        </div>
+        <button id="cams360" style="width:100%;margin-top:8px">SHOW 360° CAMERAS</button>
+      </div>
+
+      <div class="card">
+        <h3>Voice <span id="voiceState">off</span></h3>
+        <button id="voiceBtn" style="width:100%">VOICE OFF</button>
+        <div class="row" style="margin-top:8px"><input type="range" id="volume" min="0" max="100" value="50"><span class="num" id="volText" style="flex:0 0 44px;text-align:right">50 %</span></div>
+      </div>
+
+      <div class="card maponly">
+        <h3>Save Map</h3>
+        <div class="row"><input type="text" id="mapName" value="my_map" placeholder="map name"><button id="saveMap" style="flex:0 0 auto">Save</button></div>
+        <div class="muted" style="margin-top:6px">Saved into <code>maps/</code>, then usable by navigation.</div>
+      </div>
+
+      <div class="card">
+        <button class="warn" id="stopAll" style="width:100%">STOP ALL — shut everything down</button>
+        <div class="muted" style="text-align:center;margin-top:6px">Spins the LiDAR down and zeroes the motors.</div>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "/static/vendor/three.module.js" } }
+</script>
+
+<script>
+'use strict';
+// ============================================================ shared state
+const S = {
+  mode: 'navigation', ws: null, controlWs: null,
+  map: null, gcost: null, lcost: null, scan: null, plan: [],
+  pose: null, goal: null, nav: 'IDLE', speed: 0, steerCmd: 0, steerWheels: null, battery: null,
+  estop: false, cams360: false, voice: {on: false, vol: 50}, navMaxSpeed: 0.45, steerStop: 0.5236,
+  warnIds: '',
+  cx: 0, cy: 0, scale: 60, follow: true, fitted: false, tool: 'move', is3d: false,
+  drag: null, press: null,
+  layers: {map: null, gcost: null, lcost: null},
+  show: {map: true, gcost: true, lcost: true, scan: true, plan: true},
+};
+const $ = id => document.getElementById(id);
+const canvas = $('canvas'), ctx = canvas.getContext('2d');
+const view = $('view');
+// The 3D module registers itself here; stays a no-op until it has loaded.
+const V3 = {ready: false};
+
+function send(obj) {
+  const socket = obj.t === 'drive' ? S.controlWs : S.ws;
+  if (socket && socket.readyState === 1) socket.send(JSON.stringify(obj));
+}
+function toast(msg, kind = 'info') {
+  const el = document.createElement('div'); el.className = 'toast ' + kind; el.textContent = msg;
+  $('toasts').appendChild(el); setTimeout(() => el.remove(), 4000);
+}
+function b64u8(s) { const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; }
+const deg = r => r * 180 / Math.PI;
+function steerText(rad) {
+  const d = deg(rad); if (Math.abs(d) < 1.5) return 'CENTRE';
+  return `${Math.abs(d).toFixed(0)}° ${d > 0 ? 'LEFT' : 'RIGHT'}`;
+}
+
+// ============================================================== websocket
+// Grids arrive as raw binary frames (tag byte + w/h/res/ox/oy header, then
+// the cost bytes verbatim) instead of base64-in-JSON -- see pack_grid() and
+// the comment above push_loop() server-side. Smaller and, more importantly,
+// never sits queued behind other grids ahead of the live scan/pose since
+// small/live updates are now always sent first each tick.
+function handleGridBinary(buf) {
+  const dv = new DataView(buf);
+  const tag = String.fromCharCode(dv.getUint8(0));
+  const w = dv.getUint16(1, true), h = dv.getUint16(3, true);
+  const res = dv.getFloat32(5, true), ox = dv.getFloat32(9, true), oy = dv.getFloat32(13, true);
+  const yaw = dv.getFloat32(17, true);
+  const bytes = new Uint8Array(buf, 21);
+  // yaw: local costmap's origin, transformed server-side into map frame
+  // (its native frame is "odom" -- see on_lcost()'s comment). map/gcost
+  // are always 0. drawGrid/setGrid rotate the grid image about this
+  // origin so it lands correctly even when map->odom carries real
+  // rotation, not just translation.
+  const g = {w, h, res, ox, oy, yaw};
+  if (tag === 'M') {
+    S.map = g; S.layers.map = gridCanvas(bytes, w, h, mapColor);
+    V3.setGrid && V3.setGrid('map', g, S.layers.map);
+    if (!S.fitted) fit();
+  } else if (tag === 'G') {
+    S.gcost = g; S.layers.gcost = gridCanvas(bytes, w, h, costColor);
+    V3.setGrid && V3.setGrid('gcost', g, S.layers.gcost);
+  } else if (tag === 'L') {
+    S.lcost = g; S.layers.lcost = gridCanvas(bytes, w, h, costColor);
+    V3.setGrid && V3.setGrid('lcost', g, S.layers.lcost);
+  }
+}
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  S.ws = ws;
+  ws.onopen = () => { $('connDot').classList.add('on'); $('connText').textContent = 'live'; };
+  ws.onclose = () => { $('connDot').classList.remove('on'); $('connText').textContent = 'reconnecting'; setTimeout(connect, 1000); };
+  ws.onmessage = ev => {
+    if (ev.data instanceof ArrayBuffer) { handleGridBinary(ev.data); return; }
+    const m = JSON.parse(ev.data);
+    switch (m.t) {
+      case 'hello': onHello(m); break;
+      case 'scan':  S.scan = new Float32Array(b64u8(m.xy).buffer); V3.setScan && V3.setScan(S.scan); break;
+      case 'plan':  S.plan = m.pts; V3.setPlan && V3.setPlan(S.plan); break;
+      case 'state': onState(m); break;
+      case 'toast': toast(m.msg, m.kind); break;
+    }
+  };
+}
+function connectControl() {
+  const ws = new WebSocket(`ws://${location.host}/control`);
+  S.controlWs = ws;
+  ws.onopen = () => send({t: 'drive', speed: 0, steering: 0});
+  ws.onclose = () => { S.controlWs = null; setTimeout(connectControl, 500); };
+}
+
+function onHello(m) {
+  S.mode = m.mode; S.navMaxSpeed = m.nav_max_speed; S.steerStop = m.steer_stop;
+  // One attribute drives every mode difference: which cards show, which
+  // tools exist, which layers are listed, and the accent colour.
+  document.body.dataset.mode = m.mode;
+  $('modePill').textContent = m.mode;
+  // Navigation mode only: the Drive card's sliders double as Nav2's speed/
+  // steer limit (see the card's HTML comment), so reflect whatever Nav2 is
+  // actually currently limited to server-side, converting speed_pct back to
+  // the same m/s units the slider uses.  Mapping mode leaves the sliders at
+  // their own fixed manual-drive defaults -- speed_pct/steer_limit aren't
+  // meaningful there (Nav2 isn't running), and syncing from them would
+  // silently overwrite the mapping defaults with unrelated numbers.
+  if (m.mode === 'navigation') {
+    const speedMps = Math.min(0.55, Math.max(0.05, m.nav_max_speed * m.speed_pct / 100));
+    $('driveSpeed').value = speedMps.toFixed(2);
+    $('driveSpeedText').textContent = speedMps.toFixed(2);
+    const steerRad = Math.min(0.52, Math.max(0.05, +m.steer_limit));
+    $('driveSteer').value = steerRad.toFixed(2);
+    $('driveSteerText').textContent = steerRad.toFixed(2);
+  }
+  applyVoice(m.voice); applyEstop(m.estop); applyCams(m.cams360);
+  document.title = `QCar2 · ${m.mode}`;
+  V3.setMode && V3.setMode(m.mode);
+}
+
+function onState(m) {
+  S.pose = m.pose; S.goal = m.goal; S.nav = m.nav; S.speed = m.speed;
+  S.steerCmd = m.steer_cmd; S.steerWheels = m.steer_wheels; S.battery = m.battery;
+  applyEstop(m.estop); applyCams(m.cams360); applyVoice(m.voice);
+  $('battery').textContent = m.battery == null ? '—' : m.battery.toFixed(1) + ' V';
+  $('speed').textContent = Math.abs(m.speed).toFixed(2);
+  $('steer').textContent = steerText(m.steer_cmd);
+  $('toolCancel').style.display = (S.mode === 'navigation' && m.nav === 'NAVIGATING') ? 'inline-block' : 'none';
+
+  const banner = $('banner');
+  const show = ['GOAL REACHED', 'NAV FAILED', 'GOAL CANCELLED'].includes(m.nav) || m.estop;
+  banner.textContent = m.estop ? 'EMERGENCY STOP' : m.nav;
+  banner.style.color = (m.estop || m.nav === 'NAV FAILED') ? 'var(--stop)'
+    : m.nav === 'GOAL REACHED' ? 'var(--ok)' : 'var(--warn)';
+  banner.classList.toggle('show', show);
+
+  // Sticky diagnostic warnings from the backend (e.g. "too close to an
+  // obstacle to plan", "commanded to move but not responding"). Each stays
+  // up for as long as its id is present in m.warnings -- driven entirely by
+  // the backend condition, not a timer, so it can't go stale or flicker.
+  const warnBar = $('warnBar');
+  const ids = Object.keys(m.warnings || {}).sort();
+  if (ids.join(',') !== S.warnIds) {
+    S.warnIds = ids.join(',');
+    warnBar.innerHTML = '';
+    for (const id of ids) {
+      const row = document.createElement('div');
+      row.className = 'warnRow'; row.textContent = m.warnings[id];
+      warnBar.appendChild(row);
+    }
+  }
+
+  const moving = Math.abs(m.speed) > 0.02;
+  let tele = moving
+    ? `<b class="num">${Math.abs(m.speed).toFixed(2)}</b> m/s &nbsp;${m.speed < 0 ? 'REVERSE' : 'FORWARD'}`
+    : '<b>STOPPED</b>';
+  tele += `<div class="sub">STEER ${steerText(m.steer_cmd)}`;
+  // WHEELS is the angle inferred from gyro+speed -- there is no steering
+  // sensor on this car, so this is the only way to see whether the wheels
+  // actually did what they were told.
+  if (m.steer_wheels != null) tele += ` &nbsp;|&nbsp; WHEELS ${steerText(m.steer_wheels)}`;
+  $('telemetry').innerHTML = tele + '</div>';
+
+  V3.setPose && V3.setPose(m.pose, m.steer_wheels != null ? m.steer_wheels : m.steer_cmd, m.speed);
+  V3.setGoal && V3.setGoal(m.goal);
+}
+function applyEstop(on) {
+  S.estop = on; const b = $('estop');
+  b.classList.toggle('active', on);
+  b.textContent = on ? 'RELEASE EMERGENCY STOP' : 'EMERGENCY STOP';
+}
+let camsLoadTimer = null;
+function applyCams(on) {
+  if (on === S.cams360) return; S.cams360 = on;
+  $('cams').classList.toggle('grid', on); $('cams360').classList.toggle('active', on);
+  $('cams360').textContent = on ? 'HIDE 360° CAMERAS' : 'SHOW 360° CAMERAS';
+  $('camState').textContent = on ? '360°' : 'front';
+
+  clearTimeout(camsLoadTimer);
+  $('camsLoading').classList.toggle('show', on);
+  // Hide the spinner once all three side feeds have delivered a frame, or
+  // after 6 s -- whichever comes first, so a camera that fails to open
+  // doesn't leave the overlay up forever.
+  let arrived = 0;
+  for (const n of ['Rear', 'Left', 'Right']) {
+    const img = $('cam' + n);
+    img.onload = on ? () => { if (++arrived >= 3) $('camsLoading').classList.remove('show'); } : null;
+    img.src = on ? `/camera/${n.toLowerCase()}.mjpg?${Date.now()}` : '';
+  }
+  if (on) camsLoadTimer = setTimeout(() => $('camsLoading').classList.remove('show'), 6000);
+}
+
+// Measured, not assumed: browsers fire `load` on an <img> bound to a
+// multipart/x-mixed-replace stream once per delivered frame, so counting
+// those events is the real end-to-end rate reaching this browser -- which
+// is the number worth showing, not the rate the publisher was configured
+// for.  Uses the front camera since it is the one always running.
+const frameStamps = [];
+$('camFront').addEventListener('load', () => frameStamps.push(performance.now()));
+setInterval(() => {
+  const now = performance.now(), windowMs = 2000;
+  while (frameStamps.length && now - frameStamps[0] > windowMs) frameStamps.shift();
+  const fps = frameStamps.length / (windowMs / 1000);
+  $('camFps').textContent = frameStamps.length ? `${fps.toFixed(1)} fps` : '';
+}, 1000);
+function applyVoice(v) {
+  S.voice = v; $('voiceBtn').classList.toggle('active', v.on);
+  $('voiceBtn').textContent = v.on ? 'VOICE ON' : 'VOICE OFF';
+  $('voiceState').textContent = v.on ? 'on' : 'off';
+  // Both the slider AND its label must stay untouched while the slider has
+  // focus: the server's state pushes arrive at ~20 Hz and still report the
+  // pre-drag volume until 'onchange' fires on release, so overwriting the
+  // label unconditionally here fought with the live oninput update on every
+  // single push -- that fight was the flicker.
+  if (document.activeElement !== $('volume')) {
+    $('volume').value = v.vol;
+    $('volText').textContent = v.vol + ' %';
+  }
+}
+// ================================================================== grids
+// Occupancy: -1 unknown (255 unsigned), 0 free .. 100 occupied.  The SLAM
+// map is deliberately neutral grey-blue so the costmaps -- the layers that
+// mean "do not drive here" -- are the only strongly coloured things.
+function mapColor(v, d, o) {
+  if (v === 255) { d[o + 3] = 0; return; }
+  const k = 1 - v / 100;
+  d[o]     = Math.round(18 + 141 * k);
+  d[o + 1] = Math.round(26 + 154 * k);
+  d[o + 2] = Math.round(38 + 163 * k);
+  d[o + 3] = 240;
+}
+// Costmap: 0 free, 1-98 inflation gradient, 99 inscribed, 100 lethal.
+function costColor(v, d, o) {
+  if (v === 0 || v === 255) { d[o + 3] = 0; return; }
+  if (v === 100) { d[o] = 255; d[o + 1] = 60; d[o + 2] = 120; d[o + 3] = 245; return; }  // lethal  pink-red
+  if (v === 99)  { d[o] = 255; d[o + 1] = 140; d[o + 2] = 70; d[o + 3] = 225; return; }  // inscribed  orange
+  const t = v / 98;                                                                      // inflation  blue -> violet
+  d[o]     = Math.round(60 + 150 * t);
+  d[o + 1] = Math.round(90 - 40 * t);
+  d[o + 2] = 255;
+  d[o + 3] = Math.round(35 + 130 * t);
+}
+function gridCanvas(bytes, w, h, color) {
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const c2 = cv.getContext('2d'), img = c2.createImageData(w, h), d = img.data;
+  for (let j = 0; j < h; j++) {
+    const src = j * w, dst = (h - 1 - j) * w;   // grid row 0 is the BOTTOM row
+    for (let i = 0; i < w; i++) color(bytes[src + i], d, (dst + i) * 4);
+  }
+  c2.putImageData(img, 0, 0); return cv;
+}
+
+// ============================================================ 2D viewport
+let W = 0, H = 0, dpr = 1;
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = view.clientWidth; H = view.clientHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+const w2s = (x, y) => [W / 2 + (x - S.cx) * S.scale, H / 2 - (y - S.cy) * S.scale];
+const s2w = (px, py) => [S.cx + (px - W / 2) / S.scale, S.cy - (py - H / 2) / S.scale];
+function fit() {
+  const g = S.map; if (!g) return;
+  S.cx = g.ox + g.w * g.res / 2; S.cy = g.oy + g.h * g.res / 2;
+  S.scale = 0.9 * Math.min(W / (g.w * g.res), H / (g.h * g.res));
+  S.fitted = true; setFollow(false);
+  V3.fit && V3.fit(g);
+}
+function setFollow(on) { S.follow = on; $('toolFollow').classList.toggle('active', on); }
+
+function drawGrid(layer, g, alpha) {
+  if (!layer) return;
+  // Rotate about the grid's own origin corner (g.ox, g.oy), matching the
+  // world->screen convention drawCar/drawArrow already use (-yaw, since
+  // canvas rotation is clockwise-positive against world's CCW-positive
+  // yaw). Reduces to the exact previous axis-aligned draw when yaw is 0
+  // (true for map/gcost always, and for lcost whenever map==odom).
+  const [sx, sy] = w2s(g.ox, g.oy);
+  const wpx = g.w * g.res * S.scale, hpx = g.h * g.res * S.scale;
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(-(g.yaw || 0));
+  ctx.globalAlpha = alpha; ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(layer, 0, -hpx, wpx, hpx);
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+function drawCar(x, y, yaw, color, alpha = 1) {
+  const [sx, sy] = w2s(x, y);
+  ctx.save(); ctx.translate(sx, sy); ctx.rotate(-yaw); ctx.scale(S.scale, S.scale); ctx.globalAlpha = alpha;
+  ctx.fillStyle = '#0b1220'; ctx.strokeStyle = color; ctx.lineWidth = 2 / S.scale;
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(-0.215, -0.095, 0.43, 0.19, 0.03); else ctx.rect(-0.215, -0.095, 0.43, 0.19);
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = color; ctx.fillRect(0.14, -0.095, 0.075, 0.19);
+  ctx.fillStyle = '#05080f';
+  for (const [wx, wy] of [[0.13, 0.1], [0.13, -0.1], [-0.13, 0.1], [-0.13, -0.1]]) ctx.fillRect(wx - 0.035, wy - 0.02, 0.07, 0.04);
+  ctx.restore();
+}
+function drawArrow(x, y, yaw, color, len = 0.5) {
+  const [sx, sy] = w2s(x, y), ex = sx + Math.cos(yaw) * len * S.scale, ey = sy - Math.sin(yaw) * len * S.scale;
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey); ctx.stroke();
+  const a = Math.atan2(sy - ey, ex - sx);
+  ctx.beginPath(); ctx.moveTo(ex, ey);
+  ctx.lineTo(ex - 12 * Math.cos(a - 0.5), ey + 12 * Math.sin(a - 0.5));
+  ctx.lineTo(ex - 12 * Math.cos(a + 0.5), ey + 12 * Math.sin(a + 0.5));
+  ctx.closePath(); ctx.fill();
+}
+function render() {
+  requestAnimationFrame(render);
+  if (S.is3d) return;                       // 3D module drives its own loop
+  if (!W) resize();
+  if (S.follow && S.pose && !S.drag) { S.cx = S.pose.x; S.cy = S.pose.y; }
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.strokeStyle = 'rgba(120,160,200,0.07)'; ctx.lineWidth = 1;
+  const step = S.scale >= 40 ? 0.5 : S.scale >= 12 ? 1 : 5;
+  const [x0, y0] = s2w(0, H), [x1, y1] = s2w(W, 0);
+  ctx.beginPath();
+  for (let x = Math.floor(x0 / step) * step; x <= x1; x += step) { const [sx] = w2s(x, 0); ctx.moveTo(sx, 0); ctx.lineTo(sx, H); }
+  for (let y = Math.floor(y0 / step) * step; y <= y1; y += step) { const [, sy] = w2s(0, y); ctx.moveTo(0, sy); ctx.lineTo(W, sy); }
+  ctx.stroke();
+
+  if (S.map && S.show.map) drawGrid(S.layers.map, S.map, 1);
+  if (S.mode === 'navigation') {
+    if (S.gcost && S.show.gcost) drawGrid(S.layers.gcost, S.gcost, 0.5);
+    if (S.lcost && S.show.lcost) drawGrid(S.layers.lcost, S.lcost, 0.85);
+  }
+  if (S.plan.length > 1 && S.show.plan) {
+    ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 6; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.beginPath();
+    S.plan.forEach(([x, y], i) => { const [sx, sy] = w2s(x, y); i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy); });
+    ctx.stroke();
+  }
+  if (S.scan && S.show.scan) {
+    ctx.fillStyle = '#00e1ff'; const r = Math.max(2, 0.05 * S.scale);
+    for (let i = 0; i < S.scan.length; i += 2) { const [sx, sy] = w2s(S.scan[i], S.scan[i + 1]); ctx.fillRect(sx - r / 2, sy - r / 2, r, r); }
+  }
+  if (S.goal) { drawCar(S.goal.x, S.goal.y, S.goal.yaw, '#ffb454', 0.55); drawArrow(S.goal.x, S.goal.y, S.goal.yaw, '#ffb454', 0.45); }
+  if (S.pose) { drawCar(S.pose.x, S.pose.y, S.pose.yaw, '#37d8c4'); drawArrow(S.pose.x, S.pose.y, S.pose.yaw, '#37d8c4', 0.4); }
+  if (S.press) {
+    const [x, y] = s2w(S.press.x, S.press.y);
+    const color = S.tool === 'goal' ? '#ffb454' : '#b072ff';
+    drawCar(x, y, S.press.yaw, color, 0.6); drawArrow(x, y, S.press.yaw, color, 0.6);
+  }
+}
+
+// ================================================================ pointer
+function setTool(t) {
+  S.tool = t; view.className = t;
+  for (const k of ['Move', 'Pose', 'Goal']) $('tool' + k).classList.toggle('active', k.toLowerCase() === t);
+  const hint = $('hint');
+  hint.textContent = t === 'pose' ? 'Click where the car really is, drag toward the way it faces, release.'
+    : t === 'goal' ? 'Click the goal, drag to aim the final heading, release to send.' : '';
+  hint.classList.toggle('show', t !== 'move');
+  V3.setTool && V3.setTool(t);
+}
+// A pose/goal drag issued from either viewport ends up here.
+function commitPress(x, y, yaw) {
+  send({t: S.tool === 'goal' ? 'goal' : 'initialpose', x, y, yaw});
+  toast(S.tool === 'goal' ? 'Goal sent' : 'Initial pose set');
+  setTool('move');
+}
+canvas.addEventListener('pointerdown', e => {
+  canvas.setPointerCapture(e.pointerId);
+  const p = pos(e);
+  if (S.tool === 'move' || e.button !== 0) S.drag = {x: p.x, y: p.y, cx: S.cx, cy: S.cy};
+  else S.press = {x: p.x, y: p.y, yaw: S.pose ? S.pose.yaw : 0};
+});
+canvas.addEventListener('pointermove', e => {
+  const p = pos(e);
+  if (S.drag) {
+    S.cx = S.drag.cx - (p.x - S.drag.x) / S.scale;
+    S.cy = S.drag.cy + (p.y - S.drag.y) / S.scale;
+    if (S.follow) setFollow(false);
+  } else if (S.press) {
+    const dx = p.x - S.press.x, dy = S.press.y - p.y;
+    if (Math.hypot(dx, dy) > 6) S.press.yaw = Math.atan2(dy, dx);
+  }
+});
+canvas.addEventListener('pointerup', () => {
+  if (S.press) { const [x, y] = s2w(S.press.x, S.press.y); const yaw = S.press.yaw; S.press = null; commitPress(x, y, yaw); }
+  S.drag = null;
+});
+canvas.addEventListener('pointercancel', () => { S.press = null; S.drag = null; });
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const p = pos(e), [wx, wy] = s2w(p.x, p.y), f = Math.exp(-e.deltaY * 0.0015);
+  S.scale = Math.min(600, Math.max(4, S.scale * f));
+  const [nx, ny] = s2w(p.x, p.y); S.cx += wx - nx; S.cy += wy - ny;
+}, {passive: false});
+function pos(e) { const r = canvas.getBoundingClientRect(); return {x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height}; }
+
+// =============================================================== toolbar
+$('toolMove').onclick = () => setTool('move');
+$('toolPose').onclick = () => setTool('pose');
+$('toolGoal').onclick = () => setTool('goal');
+$('toolFollow').onclick = () => setFollow(!S.follow);
+$('toolFit').onclick = fit;
+$('toolCancel').onclick = () => send({t: 'cancel'});
+$('tool3d').onclick = () => {
+  S.is3d = !S.is3d;
+  document.body.classList.toggle('is3d', S.is3d);
+  $('tool3d').classList.toggle('active', S.is3d);
+  $('tool3d').textContent = S.is3d ? '2D' : '3D';
+  V3.onShow && V3.onShow(S.is3d);
+  resize();
+};
+$('toolFull').onclick = toggleFullscreen;
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => toast('Fullscreen blocked by the browser', 'warn'));
+}
+for (const [id, key] of [['lyMap', 'map'], ['lyGcost', 'gcost'], ['lyLcost', 'lcost'], ['lyScan', 'scan'], ['lyPlan', 'plan']]) {
+  $(id).onchange = e => { S.show[key] = e.target.checked; V3.setVisible && V3.setVisible(key, e.target.checked); };
+}
+
+const savedSidebar = Number(localStorage.getItem('qcar-sidebar-width'));
+if (savedSidebar >= 280 && savedSidebar <= 560) document.documentElement.style.setProperty('--sidebar-width', savedSidebar + 'px');
+let resizing = false;
+$('resizeHandle').addEventListener('pointerdown', e => {
+  resizing = true; $('resizeHandle').classList.add('dragging'); $('resizeHandle').setPointerCapture(e.pointerId); e.preventDefault();
+});
+$('resizeHandle').addEventListener('pointermove', e => {
+  if (!resizing) return;
+  const width = Math.max(280, Math.min(560, window.innerWidth - e.clientX));
+  document.documentElement.style.setProperty('--sidebar-width', width + 'px');
+  localStorage.setItem('qcar-sidebar-width', width); resize(); updateUiScale();
+});
+const endResize = () => { resizing = false; $('resizeHandle').classList.remove('dragging'); };
+$('resizeHandle').addEventListener('pointerup', endResize);
+$('resizeHandle').addEventListener('pointercancel', endResize);
+
+// ---- fixed/scroll split height, drag #vResizeHandle to resize
+const panelFixed = $('panelFixed'), vHandle = $('vResizeHandle');
+function clampFixedHeight(h) {
+  // NOT floored by panelFixed.scrollHeight: the drive card scales its own
+  // controls down via --ui-scale as this panel shrinks (see updateUiScale()
+  // below), so there is no single fixed "minimum content height" to floor
+  // against -- measuring scrollHeight at the CURRENT scale and using it as a
+  // floor is self-reinforcing (taller panel -> bigger scale -> bigger
+  // scrollHeight -> floor stays high) and was exactly why dragging the
+  // handle UP stopped working after the panel had ever been tall.  120 is
+  // simply the smallest the pad/sliders still render usably at ui-scale's
+  // own 0.6 floor.
+  const asideH = panelFixed.parentElement.clientHeight;
+  return Math.max(120, Math.min(asideH - 80, h));
+}
+// Scale the fixed panel's controls to the space it actually has, in BOTH
+// axes: the height comes from the split handle, the width from the sidebar
+// handle, and whichever is tighter decides.  Without this, dragging either
+// handle smaller just clipped the controls instead of shrinking them.
+function updateUiScale() {
+  const h = panelFixed.clientHeight, w = panelFixed.clientWidth;
+  if (!h || !w) return;
+  // 300x330 is the size at which the current layout sits at scale 1.0.
+  const scale = Math.max(0.6, Math.min(1.4, Math.min(h / 300, w / 330)));
+  document.documentElement.style.setProperty('--ui-scale', scale.toFixed(3));
+}
+function setFixedHeight(h) {
+  h = clampFixedHeight(h);
+  panelFixed.style.height = h + 'px';
+  localStorage.setItem('qcar-fixed-height', h);
+  updateUiScale();
+}
+// Default to a third of the sidebar, but never less than what the content
+// actually needs -- forcing a flat 1/3 clipped the Emergency Stop button
+// whenever the cards genuinely needed more room than that.
+const savedFixed = Number(localStorage.getItem('qcar-fixed-height'));
+const oneThird = Math.round(panelFixed.parentElement.clientHeight / 3);
+const defaultHeight = Math.max(panelFixed.scrollHeight, oneThird);
+setFixedHeight(savedFixed > 0 ? savedFixed : defaultHeight);
+window.addEventListener('resize', () => setFixedHeight(panelFixed.getBoundingClientRect().height));
+
+let vResizing = false;
+vHandle.addEventListener('pointerdown', e => {
+  vResizing = true; vHandle.classList.add('dragging'); vHandle.setPointerCapture(e.pointerId); e.preventDefault();
+});
+vHandle.addEventListener('pointermove', e => {
+  if (!vResizing) return;
+  const top = panelFixed.getBoundingClientRect().top;
+  setFixedHeight(e.clientY - top);
+});
+const endVResize = () => { vResizing = false; vHandle.classList.remove('dragging'); };
+vHandle.addEventListener('pointerup', endVResize);
+vHandle.addEventListener('pointercancel', endVResize);
+
+// ============================================================== controls
+$('estop').onclick = () => send({t: 'estop', on: !S.estop});
+$('stopAll').onclick = () => { if (confirm('Shut down every node, spin the LiDAR down and zero the motors?')) send({t: 'stopall'}); };
+$('cams360').onclick = () => send({t: 'cams360', on: !S.cams360});
+$('voiceBtn').onclick = () => send({t: 'voice', on: !S.voice.on, vol: +$('volume').value});
+$('volume').oninput = e => $('volText').textContent = e.target.value + ' %';
+$('volume').onchange = e => send({t: 'voice', on: S.voice.on, vol: +e.target.value});
+$('saveMap').onclick = () => { send({t: 'save_map', name: $('mapName').value}); toast('Saving map…'); };
+$('camFront').src = '/camera/front.mjpg';
+
+// ================================================================= drive
+const held = new Set();
+const KEYS = {w: 'forward', arrowup: 'forward', s: 'reverse', arrowdown: 'reverse',
+              a: 'left', arrowleft: 'left', d: 'right', arrowright: 'right'};
+let heartbeat = null;
+function driveUpdate() {
+  // Runs in both modes now: mapping's own manual drive, and navigation's
+  // arrow-pad override (see set_drive() in qcar2_web_gui.py).
+  const spd = +$('driveSpeed').value, str = +$('driveSteer').value;
+  const speed = spd * ((held.has('forward') ? 1 : 0) - (held.has('reverse') ? 1 : 0));
+  const steering = str * ((held.has('left') ? 1 : 0) - (held.has('right') ? 1 : 0));
+  send({t: 'drive', speed, steering});
+  const on = speed || steering;
+  $('driveState').textContent = on
+    ? `${speed > 0 ? 'forward' : speed < 0 ? 'reverse' : 'steer'}${steering > 0 ? ' left' : steering < 0 ? ' right' : ''}`
+    : 'idle';
+  document.querySelectorAll('.pad button[data-c]').forEach(b =>
+    b.classList.toggle('held', b.dataset.c.split(',').every(c => held.has(c)) && on));
+  clearInterval(heartbeat);
+  if (on) heartbeat = setInterval(() => send({t: 'drive', speed, steering}), 150);
+}
+document.querySelectorAll('.pad button[data-c]').forEach(b => {
+  const cs = b.dataset.c.split(',');
+  b.onpointerdown = e => { e.preventDefault(); b.setPointerCapture(e.pointerId); cs.forEach(c => held.add(c)); driveUpdate(); };
+  const release = () => { cs.forEach(c => held.delete(c)); driveUpdate(); };
+  b.onpointerup = release; b.onpointercancel = release;
+});
+$('driveStop').onclick = () => { held.clear(); driveUpdate(); };
+$('driveSpeed').oninput = e => $('driveSpeedText').textContent = (+e.target.value).toFixed(2);
+$('driveSteer').oninput = e => $('driveSteerText').textContent = (+e.target.value).toFixed(2);
+// Navigation mode only: releasing either slider also sets it as Nav2's own
+// autonomous speed/steering limit -- see the Drive card's HTML comment.
+// speedMps -> pct uses S.navMaxSpeed (Nav2's actual vx_max, from hello),
+// not the slider's own 0.55 max, so 100% here really means Nav2's real max.
+$('driveSpeed').onchange = e => {
+  if (S.mode !== 'navigation') return;
+  const pct = Math.round(+e.target.value / S.navMaxSpeed * 100);
+  send({t: 'speed_limit', pct: Math.max(10, Math.min(150, pct))});
+};
+$('driveSteer').onchange = e => {
+  if (S.mode === 'navigation') send({t: 'steer_limit', rad: +e.target.value});
+};
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === ' ') { e.preventDefault(); held.clear(); driveUpdate(); send({t: 'estop', on: true}); }
+  else if (k === 'escape') send({t: 'cancel'});
+  else if (k === 'f') toggleFullscreen();
+  else if (KEYS[k] && !e.repeat) { e.preventDefault(); held.add(KEYS[k]); driveUpdate(); }
+});
+window.addEventListener('keyup', e => { const k = e.key.toLowerCase(); if (KEYS[k]) { held.delete(KEYS[k]); driveUpdate(); } });
+window.addEventListener('blur', () => { if (held.size) { held.clear(); driveUpdate(); } });
+
+resize(); connect(); connectControl(); render();
+</script>
+
+<script type="module">
+// ============================================================ 3D viewport
+// Z-UP, in ROS map-frame coordinates.  Setting DEFAULT_UP before anything is
+// constructed means every position below is literally (x, y, z) from ROS --
+// no axis swapping, no sign flips, and the car model can be assembled
+// straight from QCar2.urdf's own joint origins.
+import * as THREE from 'three';
+import { OrbitControls } from '/static/vendor/OrbitControls.js';
+import { STLLoader } from '/static/vendor/STLLoader.js';
+
+THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
+
+const canvas3d = document.getElementById('threeCanvas');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x060a12);
+
+const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 200);
+camera.position.set(-2.2, -2.2, 2.0);
+
+const renderer = new THREE.WebGLRenderer({canvas: canvas3d, antialias: true});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+const controls = new OrbitControls(camera, canvas3d);
+controls.enableDamping = true; controls.dampingFactor = 0.09;
+controls.maxPolarAngle = Math.PI * 0.495;   // never drop below the floor
+controls.minDistance = 0.4; controls.maxDistance = 60;
+
+scene.add(new THREE.HemisphereLight(0xbcd6ff, 0x101a26, 2.0));
+const sun = new THREE.DirectionalLight(0xffffff, 1.9);
+sun.position.set(3, -4, 6); scene.add(sun);
+
+const grid = new THREE.GridHelper(40, 80, 0x2a4055, 0x16283a);
+grid.rotation.x = Math.PI / 2;              // GridHelper is XZ by default
+scene.add(grid);
+
+// ---- layers (all flat planes at slightly different heights so they never
+// z-fight; ROS costmaps are 2D, so this is purely a draw-order trick)
+const Z = {map: 0.001, gcost: 0.004, lcost: 0.007, plan: 0.030, scan: 0.045};
+const planes = {map: null, gcost: null, lcost: null};
+const visible = {map: true, gcost: true, lcost: true, scan: true, plan: true};
+let mode = 'navigation';
+
+function setGrid(kind, g, sourceCanvas) {
+  if (planes[kind]) { scene.remove(planes[kind]); planes[kind].geometry.dispose(); planes[kind].material.map.dispose(); planes[kind].material.dispose(); }
+  const texture = new THREE.CanvasTexture(sourceCanvas);
+  // Leave flipY at its THREE.js default (true). gridCanvas() already
+  // flips rows so a plain 2D <canvas> draws it right-side-up; that
+  // pre-flipped canvas is exactly what flipY=true expects in order to
+  // land correctly on PlaneGeometry's v=0-at-bottom/v=1-at-top mapping.
+  // Setting flipY=false here mirrors it vertically instead -- do not
+  // "fix" this back to false, that was tried and made it worse.
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.magFilter = THREE.NearestFilter; texture.minFilter = THREE.LinearMipmapLinearFilter;
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(g.w * g.res, g.h * g.res),
+    new THREE.MeshBasicMaterial({map: texture, transparent: true, depthWrite: false,
+                                 opacity: kind === 'map' ? 1 : kind === 'gcost' ? 0.5 : 0.85}));
+  // Centre = origin corner + the half-extent vector rotated by yaw (not
+  // just added axis-aligned) -- matches drawGrid's 2D handling of the
+  // same g.yaw. 0 for map/gcost always, so this reduces to the previous
+  // axis-aligned placement for them unchanged.
+  const yaw = g.yaw || 0, hw = g.w * g.res / 2, hh = g.h * g.res / 2;
+  const cx = g.ox + Math.cos(yaw) * hw - Math.sin(yaw) * hh;
+  const cy = g.oy + Math.sin(yaw) * hw + Math.cos(yaw) * hh;
+  mesh.position.set(cx, cy, Z[kind]);
+  mesh.rotation.z = yaw;
+  mesh.renderOrder = kind === 'map' ? 1 : kind === 'gcost' ? 2 : 3;
+  planes[kind] = mesh; scene.add(mesh);
+  applyVisibility();
+}
+
+let scanPoints = null;
+function setScan(xy) {
+  if (scanPoints) { scene.remove(scanPoints); scanPoints.geometry.dispose(); scanPoints.material.dispose(); scanPoints = null; }
+  if (!xy || !xy.length) return;
+  const positions = new Float32Array(xy.length / 2 * 3);
+  for (let i = 0, j = 0; i < xy.length; i += 2, j += 3) {
+    positions[j] = xy[i]; positions[j + 1] = xy[i + 1]; positions[j + 2] = Z.scan;
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  scanPoints = new THREE.Points(geometry, new THREE.PointsMaterial({color: 0x00e1ff, size: 0.05, sizeAttenuation: true}));
+  scene.add(scanPoints); applyVisibility();
+}
+
+let planLine = null;
+function setPlan(points) {
+  if (planLine) { scene.remove(planLine); planLine.geometry.dispose(); planLine.material.dispose(); planLine = null; }
+  if (!points || points.length < 2) return;
+  // A THREE.Line's `linewidth` is silently ignored on almost every
+  // WebGL backend (ANGLE/most GPUs cap it to 1px regardless of the value
+  // set) -- that's why the 3D path always looked thin no matter what.
+  // Drawn as a flat ground ribbon (a real mesh, not a line) instead, which
+  // renders at its true width on every platform.
+  const halfW = 0.05, z = Z.plan;
+  const verts = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    const [x0, y0] = points[i], [x1, y1] = points[i + 1];
+    const dx = x1 - x0, dy = y1 - y0, len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len * halfW, ny = dx / len * halfW;
+    verts.push(x0 + nx, y0 + ny, z,  x0 - nx, y0 - ny, z,  x1 + nx, y1 + ny, z);
+    verts.push(x1 + nx, y1 + ny, z,  x0 - nx, y0 - ny, z,  x1 - nx, y1 - ny, z);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
+  planLine = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({color: 0x00ff88, side: THREE.DoubleSide}));
+  scene.add(planLine); applyVisibility();
+}
+
+// ---- goal marker: a ring on the ground plus an arrow for the final heading
+const goalGroup = new THREE.Group(); goalGroup.visible = false; scene.add(goalGroup);
+{
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.15, 0.20, 32),
+    new THREE.MeshBasicMaterial({color: 0xffb454, transparent: true, opacity: 0.9, side: THREE.DoubleSide, depthWrite: false}));
+  ring.position.z = 0.02; goalGroup.add(ring);
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.34, 8),
+    new THREE.MeshBasicMaterial({color: 0xffb454}));
+  shaft.rotation.z = -Math.PI / 2; shaft.position.set(0.17, 0, 0.02); goalGroup.add(shaft);
+  const head = new THREE.Mesh(new THREE.ConeGeometry(0.045, 0.11, 12), new THREE.MeshBasicMaterial({color: 0xffb454}));
+  head.rotation.z = -Math.PI / 2; head.position.set(0.39, 0, 0.02); goalGroup.add(head);
+}
+function setGoal(goal) {
+  goalGroup.visible = !!goal && mode === 'navigation';
+  if (goal) { goalGroup.position.set(goal.x, goal.y, 0); goalGroup.rotation.z = goal.yaw; }
+}
+
+function applyVisibility() {
+  const nav = mode === 'navigation';
+  if (planes.map) planes.map.visible = visible.map;
+  if (planes.gcost) planes.gcost.visible = visible.gcost && nav;
+  if (planes.lcost) planes.lcost.visible = visible.lcost && nav;
+  if (scanPoints) scanPoints.visible = visible.scan;
+  if (planLine) planLine.visible = visible.plan;
+}
+
+// ================================================= the car, from the URDF
+// Every transform below is copied from qcar2/urdf/QCar2.urdf so the model
+// matches exactly what RViz draws.  URDF <origin rpy="r p y"> means
+// R = Rz(y)·Ry(p)·Rx(r), which in three.js is Euler order 'ZYX'.
+const WHEEL_RADIUS = 0.033;
+const robot = new THREE.Group(); robot.visible = false; scene.add(robot);
+const loader = new STLLoader();
+const bodyMat = new THREE.MeshStandardMaterial({color: 0x9aa9b4, metalness: 0.35, roughness: 0.55});
+const darkMat = new THREE.MeshStandardMaterial({color: 0x141b22, metalness: 0.2, roughness: 0.7});
+const steerHubs = [];   // rotated by the live steering angle
+const spinners = [];    // rotated by wheel roll
+
+function loadSTL(file, material, scale, parent, rpy) {
+  loader.load('/mesh/' + file, geometry => {
+    geometry.computeVertexNormals();
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.scale.setScalar(scale);
+    if (rpy) mesh.rotation.set(rpy[0], rpy[1], rpy[2], 'ZYX');
+    parent.add(mesh);
+    robot.visible = true;
+  }, undefined, () => console.warn('mesh missing:', file));
+}
+// base_link visual: QCar2Body.stl, scale 0.1, no offset.
+loadSTL('QCar2Body.stl', bodyMat, 0.1, robot);
+// lidar_joint: xyz -0.0139 0 0.194, visual origin xyz 0 0 -0.01.
+{
+  const lidar = new THREE.Group(); lidar.position.set(-0.0139, 0, 0.194 - 0.01); robot.add(lidar);
+  loadSTL('QCar2Lidar.stl', darkMat, 0.1, lidar);
+}
+// A wheel: joint origin rpy="-1.5708 0 0" from its parent, then the visual's
+// own rpy.  The spin group sits between them because the URDF spin axis is
+// the joint frame's +Z.
+function addWheel(parent, xyz, visualRpy) {
+  const jointFrame = new THREE.Group();
+  jointFrame.position.set(...xyz);
+  jointFrame.rotation.set(-Math.PI / 2, 0, 0, 'ZYX');
+  parent.add(jointFrame);
+  const spin = new THREE.Group(); jointFrame.add(spin); spinners.push(spin);
+  loadSTL('QCarWheel.stl', darkMat, 0.001, spin, visualRpy);
+}
+for (const side of [1, -1]) {
+  // hub_front*_joint: xyz 0.12960 ±0.05590 0.03338, axis 0 0 1 (steering).
+  const hub = new THREE.Group();
+  hub.position.set(0.12960, side * 0.05590, 0.03338);
+  robot.add(hub); steerHubs.push(hub);
+  loadSTL(side > 0 ? 'QCarSteeringHubL.stl' : 'QCarSteeringHubR.stl', darkMat, 0.001, hub);
+  // wheel_front*_joint is at the hub origin; visual rpy differs per side.
+  addWheel(hub, [0, 0, 0], side > 0 ? [-Math.PI / 2, 0, Math.PI] : [Math.PI / 2, 0, Math.PI]);
+  // Rear wheels hang straight off base_link.
+  addWheel(robot, [-0.12765, side * 0.05610, 0.03338], side > 0 ? [-Math.PI / 2, 0, Math.PI] : [Math.PI / 2, 0, Math.PI]);
+}
+
+// ---- live pose / steering / wheel roll
+let target = null, targetYaw = 0, steer = 0, speed = 0, lastFrame = performance.now();
+function setPose(pose, steerAngle, spd) {
+  steer = steerAngle || 0; speed = spd || 0;
+  if (!pose) return;
+  if (!target) { robot.position.set(pose.x, pose.y, 0); robot.rotation.z = pose.yaw; }
+  target = pose; targetYaw = pose.yaw;
+}
+
+// ---- Set Pose / Set Goal directly in 3D, by raycasting onto the ground.
+// RViz makes you go back to a top-down view for this; here it works from
+// whatever angle you are already looking from.
+const raycaster = new THREE.Raycaster();
+const groundPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+const hit = new THREE.Vector3();
+let tool = 'move', press = null;
+const ghost = new THREE.Group(); ghost.visible = false; scene.add(ghost);
+{
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.43, 0.19, 0.12),
+    new THREE.MeshBasicMaterial({color: 0xffb454, transparent: true, opacity: 0.45}));
+  body.position.z = 0.09; ghost.add(body);
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.14, 12), new THREE.MeshBasicMaterial({color: 0xffb454}));
+  nose.rotation.z = -Math.PI / 2; nose.position.set(0.30, 0, 0.09); ghost.add(nose);
+}
+function ground(e) {
+  const r = canvas3d.getBoundingClientRect();
+  raycaster.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1,
+                                            -((e.clientY - r.top) / r.height) * 2 + 1), camera);
+  return raycaster.ray.intersectPlane(groundPlane, hit) ? {x: hit.x, y: hit.y} : null;
+}
+canvas3d.addEventListener('pointerdown', e => {
+  if (tool === 'move' || e.button !== 0) return;
+  const p = ground(e); if (!p) return;
+  canvas3d.setPointerCapture(e.pointerId);
+  press = {x: p.x, y: p.y, yaw: target ? targetYaw : 0};
+  const colour = tool === 'goal' ? 0xffb454 : 0xb072ff;
+  ghost.traverse(o => { if (o.material) o.material.color.setHex(colour); });
+  ghost.visible = true; ghost.position.set(p.x, p.y, 0); ghost.rotation.z = press.yaw;
+});
+canvas3d.addEventListener('pointermove', e => {
+  if (!press) return;
+  const p = ground(e); if (!p) return;
+  const dx = p.x - press.x, dy = p.y - press.y;
+  if (Math.hypot(dx, dy) > 0.05) press.yaw = Math.atan2(dy, dx);
+  ghost.rotation.z = press.yaw;
+});
+canvas3d.addEventListener('pointerup', () => {
+  if (!press) return;
+  const {x, y, yaw} = press; press = null; ghost.visible = false;
+  window.qcarCommitPress(x, y, yaw);
+});
+canvas3d.addEventListener('pointercancel', () => { press = null; ghost.visible = false; });
+
+// ---- expose to the 2D shell.  V3 is a top-level `const` in the classic
+// script above; classic and module scripts share the global lexical scope,
+// so filling it in here is what switches the shell's `V3.x && V3.x()` guards
+// on once this module has finished loading.
+Object.assign(V3, {
+  ready: true, setGrid, setScan, setPlan, setGoal, setPose,
+  setVisible(key, on) { visible[key] = on; applyVisibility(); },
+  setMode(m) { mode = m; applyVisibility(); setGoal(null); },
+  setTool(t) { tool = t; controls.enabled = (t === 'move'); },
+  onShow(on) {
+    if (!on) return;
+    resize3d();
+    // Grids/scan/plan/goal that arrived over the WebSocket before this
+    // deferred module finished loading were silently dropped (the shell's
+    // `V3.setGrid && ...` guard was still false at the time). Replay
+    // whatever the 2D shell already has cached so 3D catches up instead of
+    // staying permanently blank until the next live update.
+    if (S.map) setGrid('map', S.map, S.layers.map);
+    if (S.gcost) setGrid('gcost', S.gcost, S.layers.gcost);
+    if (S.lcost) setGrid('lcost', S.lcost, S.layers.lcost);
+    if (S.scan) setScan(S.scan);
+    if (S.plan && S.plan.length) setPlan(S.plan);
+    if (S.goal) setGoal(S.goal);
+  },
+  fit(g) {
+    const span = Math.max(g.w * g.res, g.h * g.res);
+    const cx = g.ox + g.w * g.res / 2, cy = g.oy + g.h * g.res / 2;
+    controls.target.set(cx, cy, 0);
+    camera.position.set(cx - span * 0.45, cy - span * 0.55, span * 0.60);
+    controls.update();
+  },
+});
+
+function resize3d() {
+  const r = canvas3d.parentElement.getBoundingClientRect();
+  if (!r.width || !r.height) return;
+  camera.aspect = r.width / r.height; camera.updateProjectionMatrix();
+  renderer.setSize(r.width, r.height, false);
+}
+new ResizeObserver(resize3d).observe(canvas3d.parentElement);
+resize3d();
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - lastFrame) / 1000, 0.1); lastFrame = now;
+  if (!document.body.classList.contains('is3d')) return;
+
+  if (target) {
+    // Ease toward the reported pose so a 10 Hz update stream still looks
+    // continuous instead of stepping.
+    robot.position.x += (target.x - robot.position.x) * Math.min(1, dt * 9);
+    robot.position.y += (target.y - robot.position.y) * Math.min(1, dt * 9);
+    let d = targetYaw - robot.rotation.z;
+    d = Math.atan2(Math.sin(d), Math.cos(d));
+    robot.rotation.z += d * Math.min(1, dt * 9);
+    if (window.qcarFollow()) { controls.target.lerp(robot.position, Math.min(1, dt * 4)); }
+  }
+  steerHubs.forEach(h => { h.rotation.z += (steer - h.rotation.z) * Math.min(1, dt * 10); });
+  // Rolling without slipping: ω = v / R about the wheel joint's own +Z.
+  const roll = speed / WHEEL_RADIUS * dt;
+  spinners.forEach(s => { s.rotation.z += roll; });
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(frame);
+</script>
+<script>
+// Small bridges the module needs from the classic script above.
+window.qcarCommitPress = (x, y, yaw) => commitPress(x, y, yaw);
+window.qcarFollow = () => S.follow;
+</script>
+</body>
+</html>
