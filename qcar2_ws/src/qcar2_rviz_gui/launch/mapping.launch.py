@@ -56,7 +56,7 @@ def generate_launch_description():
     declare_resolution_cmd = DeclareLaunchArgument(
         'resolution', default_value='0.05', description='Map grid resolution (m/cell)')
     declare_sensor_fusion_cmd = DeclareLaunchArgument(
-        'sensor_fusion', default_value='false',
+        'sensor_fusion', default_value='true',
         description='Use LiDAR-primary mapping with wheel-encoder/gyro odometry')
 
     qcar2_gui_dir = get_package_share_directory('qcar2_rviz_gui')

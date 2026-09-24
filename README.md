@@ -295,18 +295,19 @@ scripts/start_mapping.sh
 
 Useful flags:
 ```bash
-scripts/start_mapping.sh use_cameras:=true    # opt in to the 4 CSI cameras
-scripts/start_mapping.sh use_rviz:=false      # headless, no GUI
-scripts/start_mapping.sh use_drive_gui:=false # no desktop drive console
-scripts/start_mapping.sh sensor_fusion:=true  # LiDAR primary + wheel-encoder odometry + IMU/gyro
+scripts/start_mapping.sh use_cameras:=true      # opt in to the 4 CSI cameras
+scripts/start_mapping.sh use_rviz:=false        # headless, no GUI
+scripts/start_mapping.sh use_drive_gui:=false   # no desktop drive console
+scripts/start_mapping.sh sensor_fusion:=false   # LiDAR-only mapping (no wheel-encoder/IMU odometry)
 ```
 
-`sensor_fusion:=true` starts Cartographer four seconds later so the motorp
-encoder and IMU streams are already publishing. The map is still LiDAR-based;
-encoder speed plus gyro heading provide an independent short-term motion
-estimate, and Cartographer is tuned not to accept large corrections from an
-ambiguous scan. If an auxiliary sensor has a hardware fault, return to the
-known-good scan-only mode by omitting this flag.
+`sensor_fusion` is **on by default**: it starts Cartographer four seconds
+later so the motor encoder and IMU streams are already publishing. The map
+is still LiDAR-based; encoder speed plus gyro heading provide an independent
+short-term motion estimate, and Cartographer is tuned not to accept large
+corrections from an ambiguous scan. If an auxiliary sensor has a hardware
+fault, fall back to the known-good scan-only mode with
+`sensor_fusion:=false`.
 
 The fused profile records free space out to 10 m, so an open room centre is
 shown as mapped free area rather than left unknown when the closest wall is
