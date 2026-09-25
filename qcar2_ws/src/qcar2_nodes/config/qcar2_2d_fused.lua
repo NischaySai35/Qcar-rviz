@@ -10,9 +10,26 @@ options = {
   -- This is also the IMU frame. Cartographer uses TF to transform each scan
   -- from base_scan, which is fixed 10 cm ahead of the vehicle origin.
   tracking_frame = "base_link",
-  published_frame = "base_link",
+  -- published_frame MUST be "odom", not "base_link".
+  --
+  -- With provide_odom_frame = false, Cartographer publishes
+  -- map -> <published_frame>. Setting that to "base_link" made it publish
+  -- map -> base_link directly and NO odom frame ever existed, which
+  -- contradicted the line below and silently broke anything needing the
+  -- standard map -> odom -> base_link tree. Nothing noticed while mapping was
+  -- drive-it-yourself, because only Nav2 requires that tree -- autonomous
+  -- exploration then failed with 'Invalid frame ID "odom" ... does not exist'
+  -- and the car never moved.
+  --
+  -- With "odom", Cartographer takes its map -> base_link estimate, looks up
+  -- the odom -> base_link that wheel_imu_odometry publishes, and emits the
+  -- map -> odom correction -- the normal SLAM/odometry split.
+  published_frame = "odom",
   odom_frame = "odom",
-  -- rf2o owns odom -> base_link. Cartographer publishes map -> odom only.
+  -- wheel_imu_odometry.py owns odom -> base_link (it must run with
+  -- publish_tf:=true; mapping.launch.py sets that). Cartographer publishes
+  -- map -> odom only. These two settings are a pair: changing one without
+  -- the other leaves the TF tree either broken or double-parented.
   provide_odom_frame = false,
   publish_frame_projected_to_2d = false,
   use_odometry = true,

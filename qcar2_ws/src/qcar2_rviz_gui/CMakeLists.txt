@@ -19,6 +19,11 @@ install(PROGRAMS
   scripts/qcar2_speed_limit_gui.py
   scripts/qcar2_announcer.py
   scripts/qcar2_web_gui.py
+  scripts/qcar2_object_mapper.py
+  scripts/qcar2_object_nav.py
+  scripts/qcar2_voice_command.py
+  scripts/qcar2_explorer.py
+  scripts/qcar2_assistant.py
   DESTINATION lib/${PROJECT_NAME})
 
 # Browser console served by qcar2_web_gui.py (symlink-installed, so edits to

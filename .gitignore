@@ -15,3 +15,8 @@ __pycache__/
 
 # Logs
 *.log
+
+# Downloaded model weights (YOLO-World ~25 MB, Vosk ~40 MB unpacked).
+# Not in git: they are large binaries fetched by scripts/install_deps.sh,
+# which is reproducible, so committing them would only bloat the history.
+models/

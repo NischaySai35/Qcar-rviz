@@ -16,6 +16,9 @@ windows over a forwarded desktop, so each is throttled to a preview topic:
 """
 
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 CAMERAS = [
@@ -26,13 +29,21 @@ CAMERAS = [
 
 
 def generate_launch_description():
-    nodes = []
+    # start_cameras:=false starts ONLY the preview relays. Used when the side
+    # cameras are already running -- mapping with object detection launches
+    # all four itself -- because the Quanser driver cannot open a camera twice,
+    # but the browser console still needs the /<name>/camera/preview topics.
+    start_cameras = LaunchConfiguration('start_cameras')
+    nodes = [DeclareLaunchArgument(
+        'start_cameras', default_value='true',
+        description='Start the csi camera nodes, or only the preview relays')]
     for name, cam_num in CAMERAS:
         nodes.append(Node(
             package='qcar2_nodes',
             executable='csi',
             name=f'csi_{name}',
             namespace=name,
+            condition=IfCondition(start_cameras),
             additional_env={'DISPLAY': ':0', 'XAUTHORITY': '/home/nvidia/.Xauthority'},
             parameters=[{
                 'camera_num': cam_num,

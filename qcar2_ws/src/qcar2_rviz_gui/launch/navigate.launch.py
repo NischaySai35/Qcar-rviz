@@ -63,6 +63,10 @@ def generate_launch_description():
         description='Nav2 parameters file (costmaps, planner, controller, etc.)')
     declare_autostart_cmd = DeclareLaunchArgument(
         'autostart', default_value='true', description='Auto-activate the Nav2 lifecycle nodes')
+    declare_use_voice_cmd = DeclareLaunchArgument(
+        'use_voice', default_value='true',
+        description='Run the spoken-command listener (microphone stays OFF '
+                    'until you turn it on in the browser console)')
     declare_use_speed_slider_cmd = DeclareLaunchArgument(
         'use_speed_slider', default_value='false',
         description='Open the old Tk speed-limit window (the browser console has these controls)')
@@ -203,6 +207,39 @@ def generate_launch_description():
         output='screen',
     )
 
+    # Resolves "go to the air cooler" against the semantic layer saved next to
+    # this map (<map>_objects.json) and turns it into a standoff Nav2 goal --
+    # see qcar2_object_nav.py.  Harmless if the map has no objects file: it
+    # logs once and simply never matches anything.
+    object_nav_node = Node(
+        package='qcar2_rviz_gui',
+        executable='qcar2_object_nav.py',
+        name='qcar2_object_nav',
+        output='screen',
+        parameters=[{'objects_file': map_yaml_file}],
+    )
+
+    # Spoken commands: "hey car, go to the air cooler". The microphone stays
+    # OFF until switched on in the browser console, so this is safe to run by
+    # default -- see qcar2_voice_command.py.
+    # Answers questions about the room ("is there a cooler?", "how far is it?",
+    # "how many people are here?") from the landmark map -- see
+    # qcar2_assistant.py. Facts come from the map, never from a language model.
+    assistant_node = Node(
+        package='qcar2_rviz_gui',
+        executable='qcar2_assistant.py',
+        name='qcar2_assistant',
+        output='screen',
+    )
+
+    voice_node = Node(
+        package='qcar2_rviz_gui',
+        executable='qcar2_voice_command.py',
+        name='qcar2_voice_command',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('use_voice')),
+    )
+
     # Browser console: map/costmaps/scan/plan view with Set Pose + Set Goal,
     # nav limits, e-stop, cameras, voice, all over ROS 2 through this one
     # node.  Needs no DISPLAY -- open http://<car-ip>:<web_port> from any
@@ -254,6 +291,7 @@ def generate_launch_description():
         declare_params_file_cmd,
         declare_autostart_cmd,
         declare_use_speed_slider_cmd,
+        declare_use_voice_cmd,
         OpaqueFunction(function=validate_map_file),
         hardware_launch,
         odometry_launch,
@@ -265,6 +303,9 @@ def generate_launch_description():
         nav_visualizer_node,
         goal_reset_node,
         goal_heading_node,
+        object_nav_node,
+        voice_node,
+        assistant_node,
         announcer_node,
         web_gui_node,
         rviz_node,

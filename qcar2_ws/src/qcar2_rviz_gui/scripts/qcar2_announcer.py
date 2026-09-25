@@ -34,7 +34,7 @@ from action_msgs.msg import GoalStatus, GoalStatusArray
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Int32
+from std_msgs.msg import Bool, Int32, String
 from tf2_ros import Buffer, TransformListener
 
 PULSE_SINK = 'alsa_output.platform-sound.analog-stereo'
@@ -43,8 +43,12 @@ PULSE_SINK = 'alsa_output.platform-sound.analog-stereo'
 class Speaker:
     """Serialised, non-blocking text-to-speech."""
 
-    def __init__(self, logger, rate, voice, pitch, volume_percent, enabled):
+    def __init__(self, logger, rate, voice, pitch, volume_percent, enabled,
+                 on_speaking=None):
         self.logger = logger
+        # Called with True just before each utterance and False once it has
+        # finished, so the microphone can go deaf while the car is talking.
+        self.on_speaking = on_speaking or (lambda _on: None)
         self.rate = rate
         # speech-dispatcher voice type: male1..3 / female1..3 / child_*.
         # espeak-ng renders these as pitch/timbre variants of its voice, and
@@ -98,6 +102,11 @@ class Speaker:
             if not self.enabled:
                 continue
             self.logger.info(f'SAY: {text}')
+            # Bracket the utterance so qcar2_voice_command can mute the mic
+            # for exactly as long as the speaker is talking. `spd-say -w`
+            # blocks until playback has finished, which is what makes the
+            # False edge accurate rather than a guess at speech duration.
+            self.on_speaking(True)
             try:
                 subprocess.run(
                     ['spd-say', '-w', '-r', str(self.rate), '-p', str(self.pitch),
@@ -106,6 +115,8 @@ class Speaker:
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except (OSError, subprocess.TimeoutExpired) as error:
                 self.logger.warn(f'speech failed: {error}')
+            finally:
+                self.on_speaking(False)
 
 
 class Announcer(Node):
@@ -113,7 +124,7 @@ class Announcer(Node):
         super().__init__('qcar2_announcer')
         mode = self.declare_parameter('mode', 'navigation').value
         self.obstacle_distance = float(
-            self.declare_parameter('obstacle_distance', 2.0).value)
+            self.declare_parameter('obstacle_distance', 1.5).value)
         self.obstacle_cooldown = float(
             self.declare_parameter('obstacle_cooldown', 4.0).value)
         rate = int(self.declare_parameter('speech_rate', -20).value)
@@ -121,7 +132,14 @@ class Announcer(Node):
         pitch = int(self.declare_parameter('voice_pitch', 50).value)
         volume = int(self.declare_parameter('volume_percent', 85).value)
         default_enabled = bool(self.declare_parameter('voice_enabled_default', False).value)
-        self.speaker = Speaker(self.get_logger(), rate, voice, pitch, volume, default_enabled)
+        # Half-duplex audio: /qcar2/speaking is True while the car is talking,
+        # and qcar2_voice_command drops microphone audio for that window.
+        # Without it the mic hears "Going to the air cooler" and may act on
+        # its own voice.
+        self.speaking_pub = self.create_publisher(Bool, '/qcar2/speaking', 10)
+        self.speaker = Speaker(self.get_logger(), rate, voice, pitch, volume,
+                               default_enabled, on_speaking=self.publish_speaking)
+        self.mic_on = False
 
         # Voice on/off and volume from the in-RViz control panel
         # (qcar2_rviz_panels).  transient_local so a panel that published
@@ -131,6 +149,17 @@ class Announcer(Node):
                              durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Bool, '/qcar2/voice_enabled', self.on_voice_enabled, latched)
         self.create_subscription(Int32, '/qcar2/voice_volume', self.on_voice_volume, latched)
+
+        # Arbitrary text from other nodes -- voice-command confirmations
+        # ("Going to the air cooler") and explorer progress. Routed through the
+        # same Speaker so it honours the VOICE on/off button and volume, and so
+        # it queues behind obstacle callouts instead of talking over them.
+        self.create_subscription(String, '/qcar2/say', self.on_say, 10)
+        # While the microphone is listening, obstacle callouts are suppressed
+        # entirely: they are frequent, and every one of them is speech the
+        # mic would have to be deaf through. Important messages (started,
+        # goal reached, answers to questions) are still spoken.
+        self.create_subscription(Bool, '/qcar2/mic_enabled', self.on_mic_enabled, latched)
 
         self.tf_buffer = Buffer()
         TransformListener(self.tf_buffer, self)
@@ -185,9 +214,24 @@ class Announcer(Node):
     def on_voice_volume(self, msg):
         self.speaker.set_volume(msg.data)
 
+    def on_say(self, msg):
+        text = (msg.data or '').strip()
+        if text:
+            self.speaker.say(text)
+
     # ------------------------------------------------------------- obstacles
 
+    def publish_speaking(self, on):
+        msg = Bool()
+        msg.data = bool(on)
+        self.speaking_pub.publish(msg)
+
+    def on_mic_enabled(self, msg):
+        self.mic_on = bool(msg.data)
+
     def on_scan(self, scan):
+        if self.mic_on:
+            return          # quiet while listening -- see on_mic_enabled
         now = self.get_clock().now().nanoseconds * 1e-9
         if now - self.last_obstacle_time < self.obstacle_cooldown:
             return

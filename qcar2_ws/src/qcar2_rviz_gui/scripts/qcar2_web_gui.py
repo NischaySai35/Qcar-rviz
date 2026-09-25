@@ -48,7 +48,7 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy,
                        QoSHistoryPolicy, qos_profile_sensor_data)
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import BatteryState, Image, LaserScan
-from std_msgs.msg import Bool, Empty, Int32
+from std_msgs.msg import Bool, Empty, Int32, String, UInt8MultiArray
 from tf2_ros import Buffer, TransformListener
 
 PROJECT_DIR = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz')
@@ -156,6 +156,16 @@ class State:
         self.warnings = {}
         self.jpeg = {name: (None, 0) for name in CAMERAS}
         self.camera_stamp = {name: 0.0 for name in CAMERAS}
+        # Semantic layer + the new subsystems' status, all published as JSON
+        # strings by their owning nodes and forwarded to the browser verbatim.
+        self.objects = []
+        self.answers = []        # recent question/answer pairs for the console
+        self.detections = {}     # latest live boxes per camera (see on_detections)
+        self.object_stats = {}
+        self.voice = {'enabled': False, 'source': 'car', 'status': 'off',
+                      'partial': '', 'final': '', 'action': '', 'error': ''}
+        self.explore = None
+        self.detection_jpeg = (None, 0)
 
 
 class WebGuiNode(Node):
@@ -196,6 +206,20 @@ class WebGuiNode(Node):
                 Image, topic,
                 lambda msg, name=name: self.on_image(name, msg), CAMERA_QOS)
 
+        # ---- semantic map, voice and exploration status in
+        self.create_subscription(String, '/qcar2/objects', self.on_objects, LATCHED)
+        self.create_subscription(String, '/qcar2/answer', self.on_answer, 10)
+        self.create_subscription(String, '/qcar2/detections', self.on_detections, 10)
+        self.create_subscription(String, '/qcar2/voice_transcript', self.on_voice_transcript, 10)
+        self.create_subscription(String, '/qcar2/explore_status', self.on_explore_status, LATCHED)
+        self.create_subscription(String, '/qcar2/nav_object_status', self.on_object_nav_status, 10)
+        self.create_subscription(Image, '/qcar2/detection_image',
+                                 self.on_detection_image, CAMERA_QOS)
+        # The voice node can engage the e-stop on its own ("hey car, stop"),
+        # so reflect the real topic rather than only this node's own copy --
+        # otherwise the panel button would show OFF while the car is halted.
+        self.create_subscription(Bool, '/qcar2_estop', self.on_estop_feedback, LATCHED)
+
         # ---- commands out
         self.initialpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 1)
         self.goal_pub = self.create_publisher(PoseStamped, '/goal_pose_raw', 1)
@@ -203,6 +227,18 @@ class WebGuiNode(Node):
         self.estop_pub = self.create_publisher(Bool, '/qcar2_estop', LATCHED)
         self.voice_enabled_pub = self.create_publisher(Bool, '/qcar2/voice_enabled', LATCHED)
         self.voice_volume_pub = self.create_publisher(Int32, '/qcar2/voice_volume', LATCHED)
+        # Microphone (speech IN) -- entirely separate from voice (speech OUT).
+        self.mic_enabled_pub = self.create_publisher(Bool, '/qcar2/mic_enabled', LATCHED)
+        self.mic_source_pub = self.create_publisher(String, '/qcar2/mic_source', LATCHED)
+        self.mic_audio_pub = self.create_publisher(UInt8MultiArray, '/qcar2/mic_audio', 10)
+        self.nav_to_object_pub = self.create_publisher(String, '/qcar2/nav_to_object', 10)
+        self.explore_enabled_pub = self.create_publisher(Bool, '/qcar2/explore_enabled', LATCHED)
+        self.save_objects_pub = self.create_publisher(String, '/qcar2/save_objects', 10)
+        # Typed questions to qcar2_assistant.py. Same path the voice node
+        # uses, so typing and speaking behave identically.
+        self.ask_pub = self.create_publisher(String, '/qcar2/ask', 10)
+        self.focus_pub = self.create_publisher(String, '/qcar2/camera_focus', 10)
+        self.view_360 = False
         self.motor_pub = self.create_publisher(MotorCommands, '/qcar2_motor_speed_cmd', 10)
         # Manual arrow-pad override in NAVIGATION mode (mapping mode still
         # uses motor_pub directly above -- nav2_qcar2_converter isn't even
@@ -220,6 +256,10 @@ class WebGuiNode(Node):
         # ---- operator settings (published latched so late starters get them)
         self.voice_on = False   # muted until the operator opts in
         self.voice_volume = 50
+        # Microphone starts OFF: an always-listening mic must be opt-in, and
+        # the operator should never discover it was hot without asking.
+        self.mic_on = False
+        self.mic_source = 'car'
         self.speed_pct = 100
         self.steer_limit = STEERING_STOP_RAD
         self.estop = False
@@ -228,6 +268,7 @@ class WebGuiNode(Node):
         # look valid in the UI while referring to the wrong physical place.
         self.initial_pose_set = self.mode != 'navigation'
         self.publish_voice()
+        self.publish_mic()
         self.publish_estop()
 
         # ---- manual drive (mapping only).  The hardware latches the last
@@ -512,6 +553,142 @@ class WebGuiNode(Node):
         self.voice_volume = max(0, min(int(volume), 100))
         self.publish_voice()
 
+    # ------------------------------------------------- microphone / objects
+
+    def publish_mic(self):
+        enabled = Bool()
+        enabled.data = self.mic_on
+        self.mic_enabled_pub.publish(enabled)
+        source = String()
+        source.data = self.mic_source
+        self.mic_source_pub.publish(source)
+
+    def set_mic(self, on, source):
+        self.mic_on = bool(on)
+        if source in ('car', 'browser'):
+            self.mic_source = source
+        self.publish_mic()
+        self.get_logger().info(
+            f'microphone {"ON" if self.mic_on else "OFF"} ({self.mic_source})')
+
+    def feed_mic_audio(self, data):
+        """Raw 16 kHz mono s16le from the browser -> the voice recogniser.
+
+        Only forwarded when the browser is the selected source, so a tab left
+        open cannot inject audio while the car's own mic is in use.
+        """
+        if not self.mic_on or self.mic_source != 'browser':
+            return
+        msg = UInt8MultiArray()
+        msg.data = list(data) if not isinstance(data, list) else data
+        self.mic_audio_pub.publish(msg)
+
+    def go_to_object(self, name):
+        name = (name or '').strip()
+        if not name:
+            return False
+        msg = String()
+        msg.data = name
+        self.nav_to_object_pub.publish(msg)
+        return True
+
+    def set_explore(self, on):
+        msg = Bool()
+        msg.data = bool(on)
+        self.explore_enabled_pub.publish(msg)
+
+    def on_objects(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        with self.state.lock:
+            self.state.objects = data.get('objects') or []
+            self.state.object_stats = data.get('stats') or {}
+
+    def ask(self, question):
+        question = (question or '').strip()
+        if not question:
+            return False
+        msg = String()
+        msg.data = question
+        self.ask_pub.publish(msg)
+        return True
+
+    def on_detections(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        with self.state.lock:
+            self.state.detections = data.get('cameras') or {}
+            self.state.detections_at = time.monotonic()
+
+    def on_answer(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        with self.state.lock:
+            # Keep a short history so the panel reads as a conversation
+            # rather than a single flashing line.
+            self.state.answers = ([{'q': data.get('question', ''),
+                                    'a': data.get('answer', '')}]
+                                  + self.state.answers)[:6]
+
+    def on_voice_transcript(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        with self.state.lock:
+            self.state.voice = data
+
+    def on_explore_status(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        with self.state.lock:
+            self.state.explore = data
+
+    def on_object_nav_status(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        # Surface the failure reason the same way other backend problems are
+        # surfaced, so "I do not know that object" reaches the operator
+        # instead of only the log.
+        with self.state.lock:
+            if data.get('ok'):
+                self.state.warnings.pop('object_nav', None)
+            else:
+                self.state.warnings['object_nav'] = data.get('reason', 'Object goal failed')
+
+    def on_estop_feedback(self, msg):
+        # Mirrors an e-stop engaged by anyone (e.g. "hey car, stop").
+        self.estop = bool(msg.data)
+
+    def on_detection_image(self, msg):
+        """The object mapper's annotated view, streamed like a camera.
+
+        Worth having its own stream: it is the one place you can see WHY a
+        detection did or did not become a landmark (green box = placed on the
+        map, amber = seen but no LiDAR return in its sector).
+        """
+        if msg.encoding.lower() != 'bgr8' or msg.step < msg.width * 3:
+            return
+        try:
+            frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+                msg.height, msg.step // 3, 3)[:, :msg.width]
+        except ValueError:
+            return
+        ok, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if ok:
+            with self.state.lock:
+                self.state.detection_jpeg = (jpg.tobytes(), self.state.detection_jpeg[1] + 1)
+
     def set_drive(self, speed, steering):
         if self.estop:
             return
@@ -545,11 +722,35 @@ class WebGuiNode(Node):
             msg.values = [0.0, 0.0]
         self.motor_pub.publish(msg)
 
+    def side_cameras_external(self):
+        """Are rear/left/right already running from the main launch?
+
+        In mapping mode with object detection on, mapping.launch.py starts all
+        four cameras itself. Launching cameras_side.launch.py on top of that
+        would start a SECOND csi node for each side camera, and the Quanser
+        driver cannot open the same camera twice -- the duplicates fail and
+        respawn in a loop behind a view that looks fine.
+        """
+        own = self.camera_process is not None and self.camera_process.poll() is None
+        return (not own) and self.count_publishers('/rear/camera/csi_image') > 0
+
     def set_cameras_360(self, on):
+        self.view_360 = bool(on)
+        # Tell the object mapper which view is on screen, so the camera being
+        # watched gets more detection slots (see its schedule()).
+        focus = String()
+        focus.data = 'all' if on else 'front'
+        self.focus_pub.publish(focus)
         running = self.camera_process is not None and self.camera_process.poll() is None
         if on and not running:
-            self.camera_process = subprocess.Popen(
-                ['ros2', 'launch', 'qcar2_rviz_gui', 'cameras_side.launch.py'])
+            args = ['ros2', 'launch', 'qcar2_rviz_gui', 'cameras_side.launch.py']
+            if self.side_cameras_external():
+                # Cameras already streaming (mapping with detection): start
+                # only the 5 Hz preview relays this console reads from.
+                # Skipping the launch entirely left the 360 view blank;
+                # launching it whole started duplicate camera nodes.
+                args.append('start_cameras:=false')
+            self.camera_process = subprocess.Popen(args)
         elif not on and running:
             # SIGINT so the CSI driver releases the cameras cleanly.
             self.camera_process.send_signal(2)
@@ -616,7 +817,8 @@ class WebServer:
                 'cams360': n.cameras_360_running(),
                 'speed_pct': n.speed_pct, 'steer_limit': n.steer_limit,
                 'steer_stop': STEERING_STOP_RAD, 'nav_max_speed': NAV_MAX_SPEED,
-                'estop': n.estop, 'localized': n.initial_pose_set}
+                'estop': n.estop, 'localized': n.initial_pose_set,
+                'mic': {'on': n.mic_on, 'source': n.mic_source}}
 
     def state_message(self):
         s, n = self.state, self.node
@@ -629,7 +831,15 @@ class WebServer:
                     'cams360': n.cameras_360_running(),
                     'voice': {'on': n.voice_on, 'vol': n.voice_volume},
                     'drive_held': n.drive['held'], 'localized': n.initial_pose_set,
-                    'warnings': s.warnings}
+                    'warnings': s.warnings,
+                    'mic': {'on': n.mic_on, 'source': n.mic_source},
+                    'objects': s.objects, 'object_stats': s.object_stats,
+                    'answers': s.answers,
+                    # Live boxes, dropped entirely once stale so a stopped
+                    # detector cannot leave frozen boxes drawn on live video.
+                    'detections': (s.detections if time.monotonic() -
+                                   getattr(s, 'detections_at', 0.0) < 3.0 else {}),
+                    'voice_in': s.voice, 'explore': s.explore}
 
     async def websocket(self, request):
         ws = web.WebSocketResponse(heartbeat=10, max_msg_size=0)
@@ -642,6 +852,12 @@ class WebServer:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
                     await self.handle(ws, json.loads(msg.data))
+                elif msg.type == WSMsgType.BINARY:
+                    # Browser microphone: 16 kHz mono s16le PCM. Binary rather
+                    # than base64-in-JSON because this is a continuous stream,
+                    # and the 33% base64 overhead on every chunk would show up
+                    # as recognition lag.
+                    self.node.feed_mic_audio(msg.data)
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                     break
         finally:
@@ -743,10 +959,30 @@ class WebServer:
                 await self.toast(ws, 'Steering limit will apply once the converter is up', 'warn')
         elif t == 'voice':
             n.set_voice(cmd.get('on', n.voice_on), cmd.get('vol', n.voice_volume))
+        elif t == 'mic':
+            n.set_mic(cmd.get('on', n.mic_on), cmd.get('source', n.mic_source))
+            await self.toast(
+                ws, f'Microphone {"on" if n.mic_on else "off"} ({n.mic_source})')
+        elif t == 'goto_object':
+            if n.mode != 'navigation':
+                await self.toast(ws, 'Driving to an object needs navigation mode', 'warn')
+            elif not n.initial_pose_set:
+                await self.toast(ws, "Set Pose on the car's real map position first.", 'warn')
+            elif n.go_to_object(cmd.get('name')):
+                await self.toast(ws, f'Going to the {cmd.get("name")}')
+        elif t == 'explore':
+            n.set_explore(cmd.get('on', True))
+            await self.toast(
+                ws, f'Exploration {"resumed" if cmd.get("on", True) else "paused"}')
         elif t == 'cams360':
             n.set_cameras_360(bool(cmd.get('on')))
         elif t == 'drive':
             n.set_drive(cmd.get('speed', 0.0), cmd.get('steering', 0.0))
+        elif t == 'ask':
+            if n.ask(cmd.get('q', '')):
+                await self.toast(ws, 'Asked')
+            else:
+                await self.toast(ws, 'Type a question first', 'warn')
         elif t == 'save_map':
             ok, text = await asyncio.get_event_loop().run_in_executor(
                 None, n.save_map, cmd.get('name', 'qcar_map'))
@@ -756,7 +992,9 @@ class WebServer:
 
     async def mjpeg(self, request):
         name = request.match_info['name']
-        if name not in CAMERAS:
+        # 'detections' is the object mapper's annotated view rather than a
+        # physical camera, but it streams identically.
+        if name not in CAMERAS and name != 'detections':
             raise web.HTTPNotFound()
         response = web.StreamResponse(headers={
             'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
@@ -766,7 +1004,8 @@ class WebServer:
         try:
             while True:
                 with self.state.lock:
-                    jpg, version = self.state.jpeg[name]
+                    jpg, version = (self.state.detection_jpeg if name == 'detections'
+                                    else self.state.jpeg[name])
                 if jpg is not None and version != last:
                     last = version
                     await response.write(

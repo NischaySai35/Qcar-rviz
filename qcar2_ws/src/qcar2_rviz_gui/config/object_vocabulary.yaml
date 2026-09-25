@@ -1,0 +1,107 @@
+# Object vocabulary for semantic mapping (qcar2_object_mapper.py).
+#
+# The detector is YOLO-World (open-vocabulary), so these are FREE TEXT labels,
+# not a fixed class list from a trained model. Add or remove any line here and
+# the next mapping run picks it up -- no retraining, no code change, no rebuild
+# (this file is symlink-installed).
+#
+# Why this matters: "air cooler" is not one of the 80 COCO classes, so a normal
+# YOLOv8 could never label it. YOLO-World embeds each label below with CLIP and
+# matches image regions against those embeddings, so arbitrary phrases work.
+#
+# Tips for good labels:
+#   * Prefer concrete, visually distinctive nouns ("washing machine", not "appliance").
+#   * Two or three words is fine and often BETTER than one ("office chair").
+#   * Every extra label costs a little GPU time and slightly raises the chance of
+#     a confusion, so keep this to things actually in your rooms.
+#   * `synonyms` is what voice/typed commands are matched against, so you can say
+#     "go to the cooler" or "go to the fridge" and still hit the right landmark.
+
+# Labels handed to YOLO-World as the detection vocabulary.
+classes:
+  - air cooler
+  - television
+  - sofa
+  - armchair
+  - office chair
+  - chair
+  - dining table
+  - desk
+  - coffee table
+  - bed
+  - refrigerator
+  - washing machine
+  - microwave oven
+  - stove
+  - kitchen sink
+  - cabinet
+  - bookshelf
+  - wardrobe
+  - door
+  - window
+  - staircase
+  - potted plant
+  - floor lamp
+  - ceiling fan
+  - computer monitor
+  - laptop
+  - backpack
+  - suitcase
+  - trash can
+  - shoe rack
+  - water dispenser
+  - person
+
+# Background surfaces the detector is ALLOWED to recognise, then thrown away.
+#
+# Why these exist: YOLO-World must assign every region it boxes to one of the
+# labels it was given. With no "floor" on the list, a big stretch of floor gets
+# forced onto the closest-looking furniture word -- that is how the floor came
+# out as "desk" (and then got mapped as a desk, via whatever the LiDAR hit
+# inside that huge box). Naming these surfaces gives those regions a better
+# match to fall into. Detections of these labels are never displayed, never
+# mapped, and never answered about.
+ignore:
+  - floor
+  - wooden floor
+  - wall
+  - ceiling
+
+# Extra spoken/typed names that should resolve to a mapped label above.
+# Matching is case-insensitive; a leading "the" is stripped automatically.
+synonyms:
+  air cooler: [cooler, air conditioner, ac, air con]
+  television: [tv, telly, screen, television set]
+  sofa: [couch, settee]
+  armchair: [arm chair, easy chair, recliner]
+  office chair: [desk chair, swivel chair]
+  dining table: [dinner table, table]
+  coffee table: [centre table, center table]
+  refrigerator: [fridge, freezer]
+  washing machine: [washer, washing machine]
+  microwave oven: [microwave]
+  kitchen sink: [sink, basin]
+  bookshelf: [book shelf, bookcase, shelf]
+  wardrobe: [almirah, closet, cupboard]
+  staircase: [stairs, steps]
+  potted plant: [plant, pot plant]
+  floor lamp: [lamp, standing lamp]
+  computer monitor: [monitor, display]
+  trash can: [bin, dustbin, garbage can, waste bin]
+  water dispenser: [water cooler, water filter]
+
+# Per-class tuning. `min_confidence` overrides the node's global threshold, and
+# `assoc_radius` overrides how far apart two sightings can be and still count as
+# the same physical object -- big furniture needs a wider gate than a laptop,
+# because the LiDAR hits a different part of a sofa depending on the approach.
+overrides:
+  sofa:          {assoc_radius: 1.10}
+  bed:           {assoc_radius: 1.30}
+  dining table:  {assoc_radius: 1.00}
+  wardrobe:      {assoc_radius: 1.00}
+  bookshelf:     {assoc_radius: 0.90}
+  staircase:     {assoc_radius: 1.20}
+  door:          {assoc_radius: 0.80, min_confidence: 0.35}
+  window:        {assoc_radius: 0.80, min_confidence: 0.35}
+  # People move, so they are detected but never written into the saved map.
+  person:        {assoc_radius: 0.80, min_confidence: 0.40, transient: true}

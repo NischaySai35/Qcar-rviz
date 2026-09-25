@@ -14,6 +14,9 @@
      Mapping and navigation share the shell but get their own accent so a
      glance at the screen tells you which mode the car is in. */
   :root {
+    /* Detection box colours. Identical in light and dark themes on purpose:
+       they are drawn over camera video, not over the page. */
+    --bx-person: #ff5577; --bx-mapped: #2ee6a6; --bx-norange: #ffb020;
     --bg: #eef1f5; --panel: #ffffff; --panel-2: #ffffff; --panel-3: #f2f5f8;
     --line: #dde3ea; --line-soft: #e7ebf0;
     --text: #16202c; --muted: #64748b;
@@ -180,6 +183,15 @@
   .panel-fixed button.stop { font-size: calc(14px * var(--ui-scale)); padding: calc(13px * var(--ui-scale)); }
   .panel-fixed .micro { font-size: calc(10px * var(--ui-scale)); }
   .micro { font-size: 10px; margin-top: 2px; }
+  .objrow { display: flex; justify-content: space-between; align-items: center;
+            gap: 8px; padding: 4px 6px; border-radius: 5px; font-size: 11px;
+            color: #cfe9f2; border: 1px solid transparent; }
+  .objrow + .objrow { margin-top: 2px; }
+  .objrow .objmeta { color: #6b8794; font-size: 10px; flex: 0 0 auto; }
+  .objrow.clickable { cursor: pointer; }
+  .objrow.clickable:hover { background: rgba(38, 217, 239, 0.14);
+                            border-color: rgba(38, 217, 239, 0.45); color: #fff; }
+  #objList { max-height: 190px; overflow-y: auto; }
   .micro kbd { padding: 0 3px; font-size: 9px; }
   .card h3 { margin: 0 0 9px; font-size: 10px; letter-spacing: 1.3px; text-transform: uppercase; color: var(--muted);
     display: flex; justify-content: space-between; align-items: center; font-weight: 700; }
@@ -201,6 +213,36 @@
     justify-content: center; gap: 9px; border-radius: 7px; background: rgba(255,255,255,.88);
     color: var(--muted); font-size: 11.5px; font-weight: 600; }
   .cams-loading.show { display: flex; }
+  /* Live detection overlay. Boxes are positioned in % of the image, from the
+     normalised 0..1 coordinates the car sends, so they track any view size. */
+  .cams .cell { position: relative; }
+  .ov { position: absolute; inset: 0; pointer-events: none; overflow: hidden; border-radius: 7px; }
+  .ov.off { display: none; }
+  .bx { position: absolute; border: 2px solid var(--c); border-radius: 3px;
+    box-shadow: 0 0 0 1px rgba(0,0,0,.45);
+    /* Boxes are reused per tracked object, so a walking person glides between
+       updates instead of blinking from one spot to the next. */
+    transition: left .3s linear, top .3s linear, width .3s linear, height .3s linear, opacity .3s; }
+  .bx span { position: absolute; left: -2px; bottom: 100%; background: var(--c); color: #0b1410;
+    font: 700 10.5px/1.35 system-ui, sans-serif; padding: 0 5px; border-radius: 3px 3px 3px 0;
+    white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+  .bx.top span { bottom: auto; top: 0; border-radius: 0 0 3px 0; }
+  .bx.stale { opacity: .5; border-style: dashed; }
+  .cams.grid .bx span { font-size: 9.5px; }
+  .tog { width: auto !important; padding: 1px 8px; margin: 0 6px 0 0; font-size: 9.5px; font-weight: 700;
+    letter-spacing: .6px; border-radius: 999px; line-height: 1.6; vertical-align: middle; }
+  /* "Heard" card: what the mic transcribed, and what was done with it. */
+  .heard { margin-top: 8px; border: 1px solid var(--line-soft); border-radius: 8px; padding: 6px 8px;
+    background: var(--panel-2); }
+  .heard-h { font-size: 10px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 4px; }
+  .heard-h span { text-transform: none; letter-spacing: 0; font-weight: 500; font-style: italic; }
+  .hl { padding: 3px 0; border-top: 1px dashed var(--line-soft); }
+  .hl:first-child { border-top: 0; }
+  .hl q { color: var(--text); font-weight: 600; }
+  .hl .r { display: block; font-size: 10px; }
+  .hl.acted .r { color: var(--ok); }
+  .hl.ignored .r { color: var(--muted); }
   .spinner { width: 24px; height: 24px; border: 3px solid var(--line); border-top-color: var(--accent);
     border-radius: 50%; animation: spin .7s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -263,6 +305,7 @@
       <label class="navonly"><input type="checkbox" id="lyLcost" checked><span class="swatch" style="background:#ff4fa0"></span>Local costmap</label>
       <label><input type="checkbox" id="lyScan" checked><span class="swatch" style="background:#00e1ff"></span>LiDAR</label>
       <label class="navonly"><input type="checkbox" id="lyPlan" checked><span class="swatch" style="background:#00ff88"></span>Path</label>
+      <label><input type="checkbox" id="lyObjects" checked><span class="swatch" style="background:#22d3ee"></span>Objects</label>
     </div>
 
     <div class="hint" id="hint"></div>
@@ -322,23 +365,75 @@
     <!-- Scrollable: everything else. -->
     <div class="panel-scroll">
       <div class="card">
-        <h3>Cameras <span><span id="camState">front</span> <span id="camFps" class="fps"></span></span></h3>
+        <h3>Cameras <span><button id="boxesBtn" class="tog active" title="Show detected objects on the camera views">BOXES ON</button>
+          <span id="camState">front</span> <span id="camFps" class="fps"></span></span></h3>
         <div class="cams-wrap">
           <div class="cams" id="cams">
-            <img id="camFront" alt="front">
-            <img class="side" id="camRear" alt="rear">
-            <img class="side" id="camLeft" alt="left">
-            <img class="side" id="camRight" alt="right">
+            <div class="cell"><img id="camFront" alt="front"><div class="ov" id="ovFront"></div></div>
+            <div class="cell side"><img id="camRear" alt="rear"><div class="ov" id="ovRear"></div></div>
+            <div class="cell side"><img id="camLeft" alt="left"><div class="ov" id="ovLeft"></div></div>
+            <div class="cell side"><img id="camRight" alt="right"><div class="ov" id="ovRight"></div></div>
           </div>
           <div class="cams-loading" id="camsLoading"><div class="spinner"></div>Starting cameras…</div>
         </div>
         <button id="cams360" style="width:100%;margin-top:8px">SHOW 360° CAMERAS</button>
+        <div class="muted micro" style="margin-top:6px">
+          <span style="color:var(--bx-person)">■</span> person ·
+          <span style="color:var(--bx-mapped)">■</span> object, placed on the map ·
+          <span style="color:var(--bx-norange)">■</span> seen, but no LiDAR range yet</div>
       </div>
 
       <div class="card">
         <h3>Voice <span id="voiceState">off</span></h3>
         <button id="voiceBtn" style="width:100%">VOICE OFF</button>
         <div class="row" style="margin-top:8px"><input type="range" id="volume" min="0" max="100" value="50"><span class="num" id="volText" style="flex:0 0 44px;text-align:right">50 %</span></div>
+      </div>
+
+      <div class="card">
+        <h3>Microphone <span id="micState">off</span></h3>
+        <button id="micBtn" style="width:100%">MIC OFF</button>
+        <div class="row" style="margin-top:8px">
+          <select id="micSource" style="flex:1">
+            <option value="car">Car microphone</option>
+            <option value="browser">This device's mic</option>
+          </select>
+        </div>
+        <div class="muted micro" style="margin-top:6px">
+          Say <b id="wakeHint">“hey car”</b> then a command, e.g.
+          <i>“hey car, go to the air cooler”</i>. Normal conversation is ignored.
+          <b>“stop”</b> always works on its own.
+        </div>
+        <div id="micHeard" class="muted micro" style="margin-top:6px;min-height:14px"></div>
+        <div id="micAction" class="muted micro" style="min-height:14px"></div>
+        <div class="heard" id="heardCard">
+          <div class="heard-h">Heard <span class="muted" id="heardLive"></span></div>
+          <div id="heardLog" class="muted micro">Nothing yet. Turn the mic on and speak.</div>
+        </div>
+      </div>
+
+      <div class="card" id="objectsCard">
+        <h3>Objects <span id="objState">—</span></h3>
+        <div id="objList" class="muted micro">No objects mapped yet.</div>
+        <div id="objHint" class="muted micro navonly" style="margin-top:6px">Click one to drive to it.</div>
+      </div>
+
+      <div class="card" id="askCard">
+        <h3>Ask <span id="askState">—</span></h3>
+        <div class="row">
+          <input type="text" id="askBox" placeholder="is there a cooler? how many chairs?">
+          <button id="askBtn" style="flex:0 0 auto">Ask</button>
+        </div>
+        <div id="askLog" class="muted micro" style="margin-top:6px">
+          Try: <em>is there a cooler in the room</em> · <em>how many chairs are there</em> ·
+          <em>how far is the air cooler</em> · <em>where is the desk</em> ·
+          <em>how many people are there</em> · <em>what can you see</em>
+        </div>
+      </div>
+
+      <div class="card maponly" id="exploreCard" style="display:none">
+        <h3>Auto explore <span id="exploreState">—</span></h3>
+        <button id="exploreBtn" style="width:100%">PAUSE EXPLORING</button>
+        <div id="exploreInfo" class="muted micro" style="margin-top:6px"></div>
       </div>
 
       <div class="card maponly">
@@ -368,10 +463,12 @@ const S = {
   pose: null, goal: null, nav: 'IDLE', speed: 0, steerCmd: 0, steerWheels: null, battery: null,
   estop: false, cams360: false, voice: {on: false, vol: 50}, navMaxSpeed: 0.45, steerStop: 0.5236,
   warnIds: '',
+  mic: {on: false, source: 'car'}, voiceIn: null, objects: [], objectStats: {},
+  explore: null, hoverObject: null, micStream: null, micCtx: null, objectsSig: '',
   cx: 0, cy: 0, scale: 60, follow: true, fitted: false, tool: 'move', is3d: false,
   drag: null, press: null,
   layers: {map: null, gcost: null, lcost: null},
-  show: {map: true, gcost: true, lcost: true, scan: true, plan: true},
+  show: {map: true, gcost: true, lcost: true, scan: true, plan: true, objects: true},
 };
 const $ = id => document.getElementById(id);
 const canvas = $('canvas'), ctx = canvas.getContext('2d');
@@ -471,7 +568,7 @@ function onHello(m) {
     $('driveSteer').value = steerRad.toFixed(2);
     $('driveSteerText').textContent = steerRad.toFixed(2);
   }
-  applyVoice(m.voice); applyEstop(m.estop); applyCams(m.cams360);
+  applyVoice(m.voice); applyEstop(m.estop); applyCams(m.cams360); applyMic(m.mic);
   document.title = `QCar2 · ${m.mode}`;
   V3.setMode && V3.setMode(m.mode);
 }
@@ -480,6 +577,9 @@ function onState(m) {
   S.pose = m.pose; S.goal = m.goal; S.nav = m.nav; S.speed = m.speed;
   S.steerCmd = m.steer_cmd; S.steerWheels = m.steer_wheels; S.battery = m.battery;
   applyEstop(m.estop); applyCams(m.cams360); applyVoice(m.voice);
+  applyMic(m.mic); applyVoiceIn(m.voice_in);
+  applyObjects(m.objects, m.object_stats); applyExplore(m.explore);
+  applyAnswers(m.answers); applyDetections(m.detections);
   $('battery').textContent = m.battery == null ? '—' : m.battery.toFixed(1) + ' V';
   $('speed').textContent = Math.abs(m.speed).toFixed(2);
   $('steer').textContent = steerText(m.steer_cmd);
@@ -561,6 +661,136 @@ setInterval(() => {
   const fps = frameStamps.length / (windowMs / 1000);
   $('camFps').textContent = frameStamps.length ? `${fps.toFixed(1)} fps` : '';
 }, 1000);
+// ---------------------------------------------------- microphone / objects
+function applyMic(m) {
+  if (!m) return;
+  const changed = S.mic.on !== m.on || S.mic.source !== m.source;
+  S.mic = m;
+  $('micBtn').classList.toggle('active', m.on);
+  $('micBtn').textContent = m.on ? 'MIC ON — listening' : 'MIC OFF';
+  $('micState').textContent = m.on ? (S.voiceIn && S.voiceIn.status || 'on') : 'off';
+  if ($('micSource').value !== m.source) $('micSource').value = m.source;
+  // Only (de)activate browser capture on an actual change; this runs at the
+  // state-push rate and re-requesting the mic stream every tick would make
+  // the browser's permission indicator flicker constantly.
+  if (changed) syncBrowserMic();
+}
+
+function applyVoiceIn(v) {
+  if (!v) return;
+  S.voiceIn = v;
+  if (v.wake) $('wakeHint').textContent = `“${v.wake}”`;
+  const heard = v.partial ? `… ${v.partial}` : (v.final ? `heard: “${v.final}”` : '');
+  $('micHeard').textContent = v.error ? '' : heard;
+  $('micAction').textContent = v.error ? `⚠ ${v.error}` : (v.action || '');
+  $('micAction').style.color = v.error ? 'var(--stop)' : '';
+  if (S.mic.on) $('micState').textContent = v.armed ? 'listening…' : (v.status || 'on');
+  applyHeard(v);
+}
+
+// "Heard" card: every utterance the mic transcribed, newest first, with what
+// the car DID with it. Seeing "ignored -- no 'hey car'" is as useful as seeing
+// a command work: it proves the mic hears you and shows why nothing moved.
+function applyHeard(v) {
+  $('heardLive').textContent = (S.mic.on && v.partial) ? `“${v.partial}…”` : '';
+  const list = v.history || [];
+  const key = list.map(e => `${e.t}|${e.n || 1}`).join('~');
+  if (key === S.heardKey) return;
+  S.heardKey = key;
+  if (!list.length) {
+    $('heardLog').textContent = S.mic.on ? 'Listening — nothing heard yet.'
+                                          : 'Nothing yet. Turn the mic on and speak.';
+    return;
+  }
+  $('heardLog').innerHTML = list.map(e => {
+    const when = new Date(e.t * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+    const ignored = /^ignored/.test(e.result || '');
+    const times = e.n > 1 ? ` ×${e.n}` : '';
+    return `<div class="hl ${ignored ? 'ignored' : 'acted'}">` +
+      `<span class="muted">${when}</span> <q>${esc(e.text)}</q>${times}` +
+      `<span class="r">→ ${esc(e.result || '')}</span></div>`;
+  }).join('');
+}
+
+// Question/answer log. Answers are computed on the car from the landmark map
+// (qcar2_assistant.py), not generated text -- so a number shown here is a
+// number something actually counted.
+function applyAnswers(list) {
+  if (!list || !list.length) return;
+  const key = list.map(e => e.q + '|' + e.a).join('~');
+  if (key === S.answersKey) return;
+  S.answersKey = key;
+  $('askLog').innerHTML = list.map(e =>
+    `<div style="margin-bottom:5px"><span class="muted">you:</span> ${esc(e.q)}<br>` +
+    `<b>${esc(e.a)}</b></div>`).join('');
+  $('askState').textContent = 'answered';
+}
+
+function esc(t) {
+  return String(t == null ? '' : t).replace(/[&<>"']/g,
+    c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
+function applyObjects(objects, stats) {
+  S.objects = objects || [];
+  S.objectStats = stats || {};
+  const st = $('objState');
+  if (S.objectStats.detector === 'loading') st.textContent = 'detector loading…';
+  else if (S.objectStats.detector === 'error') st.textContent = 'detector error';
+  else st.textContent = S.objects.length ? `${S.objects.length} mapped` : '—';
+
+  // Rebuild the list only when it actually changes: this is called on every
+  // state push, and replacing the DOM each time would kill hover and make the
+  // rows impossible to click.
+  const sig = S.objects.map(o => `${o.label}:${o.x.toFixed(2)},${o.y.toFixed(2)}`).join('|');
+  if (sig === S.objectsSig) return;
+  S.objectsSig = sig;
+  V3.setObjects && V3.setObjects(S.objects);
+  const list = $('objList');
+  if (!S.objects.length) {
+    list.textContent = S.objectStats.detector === 'error'
+      ? (S.objectStats.error || 'Detector failed to start.')
+      : 'No objects mapped yet.';
+    return;
+  }
+  list.innerHTML = '';
+  for (const o of S.objects) {
+    const row = document.createElement('div');
+    row.className = 'objrow';
+    row.textContent = o.label;
+    const meta = document.createElement('span');
+    meta.className = 'objmeta';
+    meta.textContent = `${o.x.toFixed(1)}, ${o.y.toFixed(1)}`;
+    row.appendChild(meta);
+    row.onmouseenter = () => { S.hoverObject = o.label; };
+    row.onmouseleave = () => { S.hoverObject = null; };
+    if (S.mode === 'navigation') {
+      row.classList.add('clickable');
+      row.onclick = () => send({t: 'goto_object', name: o.label});
+    }
+    list.appendChild(row);
+  }
+}
+
+function applyExplore(e) {
+  S.explore = e;
+  const card = $('exploreCard');
+  if (!e) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const state = e.finished ? 'done' : e.estop ? 'e-stopped' : e.paused ? 'paused'
+    : (e.state || 'exploring');
+  $('exploreState').textContent = state;
+  $('exploreBtn').textContent = e.paused ? 'RESUME EXPLORING' : 'PAUSE EXPLORING';
+  $('exploreBtn').classList.toggle('active', !e.paused && !e.finished);
+  // The reason line answers "why isn't it moving?" directly, from the
+  // explorer's own decision -- waiting for the map, e-stop, nothing reachable.
+  const why = e.reason ? `<div><b>${esc(e.reason)}</b></div>` : '';
+  $('exploreInfo').innerHTML = why +
+    `<div>${e.visited} areas reached · ${e.failed} skipped · ` +
+    `${e.frontiers != null ? e.frontiers + ' frontiers · ' : ''}` +
+    `${Math.round(e.elapsed)}s of ${Math.round(e.budget)}s</div>`;
+}
+
 function applyVoice(v) {
   S.voice = v; $('voiceBtn').classList.toggle('active', v.on);
   $('voiceBtn').textContent = v.on ? 'VOICE ON' : 'VOICE OFF';
@@ -658,6 +888,30 @@ function drawCar(x, y, yaw, color, alpha = 1) {
   for (const [wx, wy] of [[0.13, 0.1], [0.13, -0.1], [-0.13, 0.1], [-0.13, -0.1]]) ctx.fillRect(wx - 0.035, wy - 0.02, 0.07, 0.04);
   ctx.restore();
 }
+// Mapped objects: a dot plus its name. Labels are drawn in SCREEN pixels, not
+// scaled with the map, so they stay readable at every zoom level instead of
+// becoming unreadable specks when zoomed out.
+function drawObjects() {
+  ctx.save();
+  ctx.font = '600 11px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+  for (const o of S.objects) {
+    const [sx, sy] = w2s(o.x, o.y);
+    if (sx < -60 || sy < -30 || sx > W + 60 || sy > H + 30) continue;
+    const hit = o.label === S.hoverObject;
+    ctx.beginPath(); ctx.arc(sx, sy, hit ? 8 : 5.5, 0, Math.PI * 2);
+    ctx.fillStyle = hit ? '#7ef9ff' : '#26d9ef';
+    ctx.globalAlpha = 0.9; ctx.fill();
+    ctx.globalAlpha = 1; ctx.lineWidth = 1.5; ctx.strokeStyle = '#04222a'; ctx.stroke();
+    const text = o.label;
+    const w = ctx.measureText(text).width;
+    ctx.fillStyle = 'rgba(4, 12, 20, 0.78)';
+    ctx.fillRect(sx - w / 2 - 4, sy - 22, w + 8, 14);
+    ctx.fillStyle = hit ? '#ffffff' : '#bdf3fb';
+    ctx.fillText(text, sx, sy - 10);
+  }
+  ctx.restore();
+}
 function drawArrow(x, y, yaw, color, len = 0.5) {
   const [sx, sy] = w2s(x, y), ex = sx + Math.cos(yaw) * len * S.scale, ey = sy - Math.sin(yaw) * len * S.scale;
   ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 3; ctx.lineCap = 'round';
@@ -697,6 +951,7 @@ function render() {
     ctx.fillStyle = '#00e1ff'; const r = Math.max(2, 0.05 * S.scale);
     for (let i = 0; i < S.scan.length; i += 2) { const [sx, sy] = w2s(S.scan[i], S.scan[i + 1]); ctx.fillRect(sx - r / 2, sy - r / 2, r, r); }
   }
+  if (S.objects.length && S.show.objects) drawObjects();
   if (S.goal) { drawCar(S.goal.x, S.goal.y, S.goal.yaw, '#ffb454', 0.55); drawArrow(S.goal.x, S.goal.y, S.goal.yaw, '#ffb454', 0.45); }
   if (S.pose) { drawCar(S.pose.x, S.pose.y, S.pose.yaw, '#37d8c4'); drawArrow(S.pose.x, S.pose.y, S.pose.yaw, '#37d8c4', 0.4); }
   if (S.press) {
@@ -772,7 +1027,7 @@ function toggleFullscreen() {
   if (document.fullscreenElement) document.exitFullscreen();
   else document.documentElement.requestFullscreen().catch(() => toast('Fullscreen blocked by the browser', 'warn'));
 }
-for (const [id, key] of [['lyMap', 'map'], ['lyGcost', 'gcost'], ['lyLcost', 'lcost'], ['lyScan', 'scan'], ['lyPlan', 'plan']]) {
+for (const [id, key] of [['lyMap', 'map'], ['lyGcost', 'gcost'], ['lyLcost', 'lcost'], ['lyScan', 'scan'], ['lyPlan', 'plan'], ['lyObjects', 'objects']]) {
   $(id).onchange = e => { S.show[key] = e.target.checked; V3.setVisible && V3.setVisible(key, e.target.checked); };
 }
 
@@ -850,9 +1105,161 @@ vHandle.addEventListener('pointercancel', endVResize);
 $('estop').onclick = () => send({t: 'estop', on: !S.estop});
 $('stopAll').onclick = () => { if (confirm('Shut down every node, spin the LiDAR down and zero the motors?')) send({t: 'stopall'}); };
 $('cams360').onclick = () => send({t: 'cams360', on: !S.cams360});
+// ------------------------------------------------------- browser microphone
+// Capture from this device and stream raw PCM to the car over the existing
+// WebSocket. The car resamples nothing: we downsample to 16 kHz here because
+// that is what Vosk wants, and doing it in the browser keeps the wire traffic
+// at ~32 kB/s instead of shipping 48 kHz float audio.
+async function startBrowserMic() {
+  if (S.micStream) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    toast('This browser will not give a microphone over plain HTTP. Use the car mic.', 'warn');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true},
+    });
+    const actx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = actx.createMediaStreamSource(stream);
+    // ScriptProcessor is deprecated but is the one path that works without
+    // serving a separate AudioWorklet module file; the buffer is large enough
+    // that its main-thread cost is negligible.
+    const proc = actx.createScriptProcessor(4096, 1, 1);
+    const ratio = actx.sampleRate / 16000;
+    proc.onaudioprocess = ev => {
+      if (!S.mic.on || S.mic.source !== 'browser') return;
+      if (!S.ws || S.ws.readyState !== 1) return;
+      const input = ev.inputBuffer.getChannelData(0);
+      const out = new Int16Array(Math.floor(input.length / ratio));
+      for (let i = 0; i < out.length; i++) {
+        // Average the samples in each bin rather than picking one of them.
+        // Plain decimation (taking every Nth sample) folds everything above
+        // 8 kHz back down into the speech band as aliasing noise, which the
+        // recogniser hears as slurred consonants. This box average is a crude
+        // low-pass, but it is nearly free and removes most of that.
+        const start = Math.floor(i * ratio);
+        const end = Math.min(input.length, Math.floor((i + 1) * ratio));
+        let sum = 0;
+        for (let j = start; j < end; j++) sum += input[j];
+        const s = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      S.ws.send(out.buffer);
+    };
+    src.connect(proc); proc.connect(actx.destination);
+    S.micStream = stream; S.micCtx = {actx, proc, src};
+  } catch (err) {
+    toast('Microphone permission denied: ' + err.message, 'warn');
+  }
+}
+
+function stopBrowserMic() {
+  if (S.micCtx) {
+    try { S.micCtx.proc.disconnect(); S.micCtx.src.disconnect(); S.micCtx.actx.close(); } catch (e) {}
+    S.micCtx = null;
+  }
+  if (S.micStream) {
+    S.micStream.getTracks().forEach(t => t.stop());
+    S.micStream = null;
+  }
+}
+
+function syncBrowserMic() {
+  if (S.mic.on && S.mic.source === 'browser') startBrowserMic(); else stopBrowserMic();
+}
+
+// Swap the main camera pane between the raw front feed and the object
+// mapper's annotated view. Same <img>, so the FPS counter keeps working.
+// ------------------------------------------------------- detection boxes
+// Boxes arrive as data (normalised 0..1 coords per camera) and are drawn here
+// as positioned divs over each feed, so all four 360 views get live boxes and
+// the car never has to re-encode an annotated video stream.
+const OVERLAYS = {front: 'ovFront', rear: 'ovRear', left: 'ovLeft', right: 'ovRight'};
+let boxesOn = true;                                   // default ON
+try { if (localStorage.getItem('qcar2.boxes') === 'off') boxesOn = false; } catch (e) {}
+
+function applyBoxesButton() {
+  $('boxesBtn').classList.toggle('active', boxesOn);
+  $('boxesBtn').textContent = boxesOn ? 'BOXES ON' : 'BOXES OFF';
+  Object.values(OVERLAYS).forEach(id => $(id).classList.toggle('off', !boxesOn));
+}
+$('boxesBtn').onclick = () => {
+  boxesOn = !boxesOn;
+  try { localStorage.setItem('qcar2.boxes', boxesOn ? 'on' : 'off'); } catch (e) {}
+  applyBoxesButton();
+};
+applyBoxesButton();
+
+function boxLabel(d) {
+  const rng = d.range != null ? ` · ${d.range.toFixed(1)} m` : '';
+  return d.label + rng;
+}
+
+function applyDetections(cams) {
+  if (!boxesOn) return;
+  cams = cams || {};
+  for (const [cam, ovId] of Object.entries(OVERLAYS)) {
+    const ov = $(ovId);
+    const entry = cams[cam];
+    // A camera the detector has not revisited recently shows nothing, rather
+    // than a box frozen over something that may have walked away.
+    const list = (entry && entry.age < 3.0) ? entry.boxes : [];
+    const keep = new Set();
+    list.forEach((d, i) => {
+      // Reuse the element for the same tracked object, so its box glides to
+      // the new position (CSS transition) instead of blinking.
+      const key = d.key || (d.id != null ? `id${d.id}` : `ix${i}-${d.raw}`);
+      keep.add(key);
+      let el = ov.querySelector(`[data-k="${key}"]`);
+      if (!el) {
+        el = document.createElement('div');
+        el.className = 'bx';
+        el.dataset.k = key;
+        el.appendChild(document.createElement('span'));
+        ov.appendChild(el);
+      }
+      const colour = d.kind === 'person' ? 'var(--bx-person)'
+        : (d.range != null ? 'var(--bx-mapped)' : 'var(--bx-norange)');
+      el.style.setProperty('--c', colour);
+      el.style.left = (d.x1 * 100) + '%';
+      el.style.top = (d.y1 * 100) + '%';
+      el.style.width = (Math.max(0, d.x2 - d.x1) * 100) + '%';
+      el.style.height = (Math.max(0, d.y2 - d.y1) * 100) + '%';
+      el.classList.toggle('top', d.y1 < 0.07);          // label inside at the top edge
+      // Held over from a recent frame but not re-confirmed on this one:
+      // drawn faded, so a lingering box is never mistaken for a fresh one.
+      el.classList.toggle('stale', !!d.stale);
+      el.firstChild.textContent = boxLabel(d);
+      el.title = `${d.label} (${Math.round(d.conf * 100)}%)` +
+        (d.raw && d.raw !== d.label.replace(/ \d+$/, '') ? ` · detector said "${d.raw}"` : '');
+    });
+    ov.querySelectorAll('.bx').forEach(el => { if (!keep.has(el.dataset.k)) el.remove(); });
+  }
+}
+
+$('micBtn').onclick = () => send({t: 'mic', on: !S.mic.on, source: $('micSource').value});
+$('micSource').onchange = e => send({t: 'mic', on: S.mic.on, source: e.target.value});
+$('exploreBtn').onclick = () => send({t: 'explore', on: !!(S.explore && S.explore.paused)});
 $('voiceBtn').onclick = () => send({t: 'voice', on: !S.voice.on, vol: +$('volume').value});
 $('volume').oninput = e => $('volText').textContent = e.target.value + ' %';
 $('volume').onchange = e => send({t: 'voice', on: S.voice.on, vol: +e.target.value});
+function sendAsk() {
+  const q = $('askBox').value.trim();
+  if (!q) return;
+  send({t: 'ask', q});
+  $('askState').textContent = 'thinking…';
+  $('askBox').value = '';
+}
+$('askBtn').onclick = sendAsk;
+$('askBox').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); sendAsk(); }
+});
+// The drive pad listens for W/A/S/D globally; typing a question must not
+// make the car lurch across the room.
+['keydown', 'keyup', 'keypress'].forEach(ev =>
+  $('askBox').addEventListener(ev, e => e.stopPropagation()));
+
 $('saveMap').onclick = () => { send({t: 'save_map', name: $('mapName').value}); toast('Saving map…'); };
 $('camFront').src = '/camera/front.mjpg';
 
@@ -951,7 +1358,7 @@ scene.add(grid);
 // z-fight; ROS costmaps are 2D, so this is purely a draw-order trick)
 const Z = {map: 0.001, gcost: 0.004, lcost: 0.007, plan: 0.030, scan: 0.045};
 const planes = {map: null, gcost: null, lcost: null};
-const visible = {map: true, gcost: true, lcost: true, scan: true, plan: true};
+const visible = {map: true, gcost: true, lcost: true, scan: true, plan: true, objects: true};
 let mode = 'navigation';
 
 function setGrid(kind, g, sourceCanvas) {
@@ -1023,6 +1430,87 @@ function setPlan(points) {
 
 // ---- goal marker: a ring on the ground plus an arrow for the final heading
 const goalGroup = new THREE.Group(); goalGroup.visible = false; scene.add(goalGroup);
+
+// ---- mapped objects. The 2D view drew S.objects itself and nothing ever
+// handed them to this module, which is why 3D showed none. Same data here: a
+// pin on a pole plus the name. Labels use sizeAttenuation:false so they keep a
+// constant on-screen size like the 2D labels, rather than shrinking to
+// unreadable specks when you zoom out.
+const objectsGroup = new THREE.Group(); scene.add(objectsGroup);
+const objectMarkers = new Map();          // stable key -> {group, pole, label, sprite}
+const PIN_GEO = new THREE.SphereGeometry(0.07, 18, 12);
+const PIN_MAT = new THREE.MeshStandardMaterial({color: 0x22d3ee, emissive: 0x0b4f5c, roughness: 0.4});
+const POLE_MAT = new THREE.LineBasicMaterial({color: 0x22d3ee, transparent: true, opacity: 0.7});
+const POLE_H = 0.42;
+
+function labelSprite(text) {
+  const c = document.createElement('canvas');
+  const ctx = c.getContext('2d');
+  const font = '600 40px ui-monospace, Menlo, Consolas, monospace';
+  ctx.font = font;
+  const w = Math.ceil(ctx.measureText(text).width) + 28, h = 60;
+  c.width = w; c.height = h;
+  ctx.font = font;                         // resizing the canvas resets it
+  ctx.fillStyle = 'rgba(8, 14, 24, 0.88)';
+  if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(0, 0, w, h, 10); ctx.fill(); }
+  else ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = '#ffffff';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 14, h / 2 + 2);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial(
+    {map: tex, sizeAttenuation: false, depthTest: false, transparent: true}));
+  const H = 0.034;                         // fraction of the viewport height
+  sprite.scale.set(H * w / h, H, 1);
+  sprite.center.set(0.5, 0);               // sit on top of the pin
+  sprite.renderOrder = 10;                 // never hidden behind the map plane
+  return sprite;
+}
+
+function disposeSprite(sprite) {
+  if (!sprite) return;
+  sprite.material.map.dispose();
+  sprite.material.dispose();
+}
+
+function setObjects(list) {
+  // Markers are reused by id: positions update every second as landmarks
+  // self-correct, and rebuilding every label texture each time would churn
+  // GPU memory. A new texture is made only when an object's NAME changes.
+  const seen = new Set();
+  (list || []).forEach((o, i) => {
+    const key = o.id != null ? `id${o.id}` : `${o.label}#${i}`;
+    seen.add(key);
+    let m = objectMarkers.get(key);
+    if (!m) {
+      const group = new THREE.Group();
+      const pin = new THREE.Mesh(PIN_GEO, PIN_MAT);
+      pin.position.z = POLE_H;
+      const pole = new THREE.Line(new THREE.BufferGeometry().setFromPoints(
+        [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, POLE_H)]), POLE_MAT);
+      group.add(pin, pole);
+      m = {group, pole, label: null, sprite: null};
+      objectsGroup.add(group);
+      objectMarkers.set(key, m);
+    }
+    m.group.position.set(o.x, o.y, 0);
+    if (m.label !== o.label) {
+      if (m.sprite) { m.group.remove(m.sprite); disposeSprite(m.sprite); }
+      m.sprite = labelSprite(o.label);
+      m.sprite.position.z = POLE_H + 0.1;
+      m.group.add(m.sprite);
+      m.label = o.label;
+    }
+  });
+  for (const [key, m] of objectMarkers) {
+    if (seen.has(key)) continue;
+    objectsGroup.remove(m.group);
+    m.pole.geometry.dispose();
+    disposeSprite(m.sprite);
+    objectMarkers.delete(key);
+  }
+}
 {
   const ring = new THREE.Mesh(new THREE.RingGeometry(0.15, 0.20, 32),
     new THREE.MeshBasicMaterial({color: 0xffb454, transparent: true, opacity: 0.9, side: THREE.DoubleSide, depthWrite: false}));
@@ -1045,6 +1533,7 @@ function applyVisibility() {
   if (planes.lcost) planes.lcost.visible = visible.lcost && nav;
   if (scanPoints) scanPoints.visible = visible.scan;
   if (planLine) planLine.visible = visible.plan;
+  objectsGroup.visible = visible.objects;
 }
 
 // ================================================= the car, from the URDF
@@ -1157,7 +1646,7 @@ canvas3d.addEventListener('pointercancel', () => { press = null; ghost.visible =
 // so filling it in here is what switches the shell's `V3.x && V3.x()` guards
 // on once this module has finished loading.
 Object.assign(V3, {
-  ready: true, setGrid, setScan, setPlan, setGoal, setPose,
+  ready: true, setGrid, setScan, setPlan, setGoal, setPose, setObjects,
   setVisible(key, on) { visible[key] = on; applyVisibility(); },
   setMode(m) { mode = m; applyVisibility(); setGoal(null); },
   setTool(t) { tool = t; controls.enabled = (t === 'move'); },
@@ -1175,6 +1664,7 @@ Object.assign(V3, {
     if (S.scan) setScan(S.scan);
     if (S.plan && S.plan.length) setPlan(S.plan);
     if (S.goal) setGoal(S.goal);
+    if (S.objects) setObjects(S.objects);
   },
   fit(g) {
     const span = Math.max(g.w * g.res, g.h * g.res);
@@ -1184,6 +1674,10 @@ Object.assign(V3, {
     controls.update();
   },
 });
+
+// Objects that arrived over the WebSocket before this deferred module loaded
+// were skipped by the shell's `V3.setObjects &&` guard; catch up now.
+if (S.objects && S.objects.length) setObjects(S.objects);
 
 function resize3d() {
   const r = canvas3d.parentElement.getBoundingClientRect();

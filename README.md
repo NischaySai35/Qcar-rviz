@@ -54,8 +54,21 @@ Qcar-rviz/
 │       │                       "Bugs I fixed" below)
 │       └── qcar2_rviz_gui/    <-- NEW, written for this project:
 │           ├── rviz/qcar2_full_gui.rviz   the GUI layout
-│           └── launch/                    launch files (see below)
-├── maps/                      <- your saved maps land here (.yaml + .pgm)
+│           ├── web/index.html             the browser console
+│           ├── config/object_vocabulary.yaml  <- EDIT THIS to change which
+│           │                               objects can be detected
+│           ├── launch/                    launch files (see below)
+│           └── scripts/
+│               ├── qcar2_object_mapper.py   cameras + LiDAR -> named
+│               │                            landmarks on the map
+│               ├── qcar2_object_nav.py      "go to the air cooler" -> a goal
+│               ├── qcar2_voice_command.py   wake-word speech commands
+│               ├── qcar2_explorer.py        frontier auto-exploration
+│               └── ...                      (the rest, see §4)
+├── maps/                      <- saved maps land here (.yaml + .pgm, plus
+│                                 <name>_objects.json for the object labels)
+├── models/                    <- downloaded YOLO-World + Vosk weights
+│                                 (gitignored; scripts/install_deps.sh fetches)
 ├── scripts/                   <- shell scripts, see Quick Start
 └── archive/                   <- your two earlier attempts, kept for
     ├── QCar_Navigation_standalone_opencv/   reference, not used anymore
@@ -105,10 +118,15 @@ build, edits apply immediately without rebuilding).
 
 ---
 
-## 4. Two modes
+## 4. Three modes
 
 **Mapping mode** — drive around, build a brand-new map with Cartographer SLAM.
-**Navigation mode** — load a map you already saved, and click-to-drive with Nav2.
+While mapping, the four cameras also **label the map with the objects they
+see**, so the saved map knows where the sofa and the air cooler are.
+**Autonomous mapping** — the same thing, except the car explores and drives
+itself until the room is covered (`scripts/start_mapping_auto.sh`).
+**Navigation mode** — load a map you already saved, and click-to-drive with
+Nav2 — or say *“hey car, go to the air cooler”*.
 
 ---
 
@@ -233,6 +251,17 @@ scripts/build.sh
 This compiles the driver, cartographer, rf2o and the new GUI package. Takes
 a few minutes the first time (rebuilds are much faster).
 
+### One-time setup: object detection + voice commands
+```bash
+scripts/install_deps.sh
+```
+Installs the CLIP text encoder, `vosk` + `sounddevice`, and downloads the
+YOLO-World and speech models into `models/`. Safe to re-run — every step
+checks first and skips what is already done. It deliberately installs with
+`--no-deps` into `/usr/bin/python3`, because this car's `torch` is NVIDIA's
+Jetson build and a dependency resolver would happily replace it with a
+generic wheel that has no CUDA.
+
 ### Every terminal you open for this project, first run:
 ```bash
 cd ~/Desktop/Qcar-rviz
@@ -299,6 +328,8 @@ scripts/start_mapping.sh use_cameras:=true      # opt in to the 4 CSI cameras
 scripts/start_mapping.sh use_rviz:=false        # headless, no GUI
 scripts/start_mapping.sh use_drive_gui:=false   # no desktop drive console
 scripts/start_mapping.sh sensor_fusion:=false   # LiDAR-only mapping (no wheel-encoder/IMU odometry)
+scripts/start_mapping.sh detect_objects:=false  # skip object labelling (no cameras, no GPU load)
+scripts/start_mapping.sh use_voice:=false       # do not start the voice listener at all
 ```
 
 `sensor_fusion` is **on by default**: it starts Cartographer four seconds
@@ -312,6 +343,229 @@ fault, fall back to the known-good scan-only mode with
 The fused profile records free space out to 10 m, so an open room centre is
 shown as mapped free area rather than left unknown when the closest wall is
 distant.
+
+### A2) Object labels on the map (on by default while mapping)
+
+While you map, all four CSI cameras run an **open-vocabulary detector**
+(YOLO-World) and the map gets labelled with what is in the room. Saving the
+map writes a third file next to the `.pgm`/`.yaml`:
+
+```text
+maps/my_room.yaml          the usual occupancy grid metadata
+maps/my_room.pgm           the usual occupancy grid
+maps/my_room_objects.json  <- names + map coordinates of what was seen
+```
+
+Turn it off with `scripts/start_mapping.sh detect_objects:=false`.
+
+**Why "open-vocabulary" matters.** A normal YOLOv8 only knows the 80 COCO
+classes, and *air cooler is not one of them* — it could never label yours.
+YOLO-World takes free text instead: every label is embedded with CLIP and
+matched against the image. So the detectable set is just a list you edit:
+
+```text
+qcar2_ws/src/qcar2_rviz_gui/config/object_vocabulary.yaml
+```
+Add `"water purifier"`, `"shoe rack"`, anything. No retraining, no rebuild
+(the file is symlink-installed). `synonyms:` in the same file is what lets
+you *say* "fridge" and have it find the `refrigerator`.
+
+**How a camera pixel becomes a map coordinate.** The bounding box's left and
+right edges become two rays in that camera's frame — taken from the URDF
+mounts (`csi_front/back/left/right`), so there are no hand-tuned per-camera
+angles anywhere. Those rays define an angular sector; every LiDAR return
+inside it is a candidate, and the **nearest cluster** is the object (whatever
+the camera sees must be in front of whatever it cannot, so the wall behind is
+correctly ignored). That cluster's centre is transformed into the map frame.
+
+**Why the same TV is never mapped twice.** This is the part that usually goes
+wrong with multiple cameras, and it is solved by *never comparing detections
+as images*. Every sighting becomes a map coordinate **before** anything is
+compared. So when the car turns and the TV that was in the front camera
+appears in the left camera, it resolves to the same coordinate and merges
+into the existing landmark — the second camera *raises the confidence*
+instead of creating a duplicate. Which camera saw it is recorded as evidence
+but is deliberately not part of the matching. On top of that: a per-class
+distance gate (a sofa needs a wider one than a laptop), a periodic merge pass
+that heals SLAM loop-closure drift, and `min_hits` sightings required before
+anything is published — so a one-frame false positive never reaches the map.
+
+**Known limitation — the 2D LiDAR plane.** The LiDAR sweeps one horizontal
+plane about 19 cm off the floor. An object that never crosses that plane — a
+wall-mounted TV, a rug, a picture — gets a bearing but no range, so it is
+counted as *unresolved* and skipped rather than guessed at. Anything standing
+on the floor maps fine. In the browser console press **SHOW DETECTIONS**:
+green boxes were placed on the map, amber ones had no LiDAR range.
+
+Tuning worth knowing (all `ros2 param` on `/qcar2_object_mapper`):
+
+| Parameter | Default | What it does |
+|---|---|---|
+| `hfov_deg` | `120.0` | CSI lens horizontal FOV. Quanser publish no intrinsics and the driver emits no `CameraInfo`, so this is a **tunable, not a calibration**. If labels land consistently left/right of the real object, this is the knob. |
+| `detect_rate_hz` | `6.0` | Total detections/sec across all 4 cameras (round-robin), so GPU load does not scale with camera count. |
+| `min_hits` | `3` | Sightings before a landmark is published/saved. |
+| `assoc_radius` | `0.60` m | How close two sightings must be to count as one object. Per-class overrides live in the vocabulary YAML. |
+| `max_range` | `6.0` m | Ignore detections further away than this. |
+
+### A3) Autonomous mapping — the car maps the room by itself
+
+```bash
+scripts/start_mapping_auto.sh              # saves maps/auto_map.*
+scripts/start_mapping_auto.sh my_room      # or pick the name
+```
+
+It brings up mapping (with object detection), runs **Nav2 on the live SLAM
+map**, and repeatedly drives to the best *frontier* — the boundary between
+mapped and unknown space. Going to a frontier is by definition the move that
+reveals the most new map, which is why this beats a fixed lawnmower pattern:
+it adapts to the room's actual shape and stops on its own when there is
+nothing unknown left to reach. When it finishes it **saves the map and the
+objects automatically**, then shuts down cleanly (LiDAR spun down).
+
+It reuses the *same* tuned Nav2 you drive with in navigation mode — MPPI
+controller, Hybrid-A\* planner, your Ackermann behaviour tree — so all the
+obstacle-avoidance tuning applies. Only the navigation half starts: no AMCL
+and no map_server, because Cartographer already publishes `/map` **and** owns
+`map -> odom`; starting Nav2's localization too would put two nodes in charge
+of the same transform.
+
+Ackermann realities it respects: this car cannot turn in place (min radius
+~0.45 m), so frontiers closer than `min_goal_distance` are skipped, and a
+frontier that fails twice is **blacklisted** so the planner is not asked the
+same impossible question forever.
+
+You stay in control the whole time at `http://<car-ip>:8080`: **E-STOP**
+pauses it, the drive pad overrides it, **PAUSE EXPLORING** holds it, and
+`Ctrl+C` saves the map built so far before shutting down. Default time budget
+is 900 s (`TIME_BUDGET` at the top of the script).
+
+### A4) Voice commands — "hey car, go to the air cooler"
+
+There is a **MIC** button in the browser console. It is **off by default** —
+an always-listening microphone should be something you opt into. Turn it on
+and say:
+
+```text
+"hey car, go to the air cooler"      drive to a mapped object
+"hey car, go to the fridge"          synonyms work
+"hey car"  →  "Yes?"  →  "go to the sofa"      two-step also works
+"stop"                               emergency stop (no wake phrase needed)
+"hey car, cancel"                    cancel the current goal
+"hey car, resume"                    release the e-stop
+```
+
+**Why it ignores your normal conversation.** Three independent filters,
+because for something always listening any one alone is not enough:
+
+1. **Wake phrase.** Nothing acts unless the utterance contains *"hey car"*.
+   Saying *"I should go to the air cooler later"* to a person does nothing.
+2. **Restricted grammar.** Vosk is given an explicit word list — the wake
+   phrase, the command verbs and your object names — instead of open
+   vocabulary, so unrelated speech cannot be force-fitted onto the nearest
+   command. This also makes it noticeably faster and more accurate on the
+   words that do matter.
+3. **Intent match.** What survives must still parse as a command *and* resolve
+   to an object on the map.
+
+The one deliberate exception is a bare **"stop"**, which works without the
+wake phrase: a spurious stop costs nothing, needing a wake phrase during an
+emergency is a genuinely bad trade. Turn that off with
+`emergency_stop_without_wake:=false`.
+
+**Two microphones**, switchable in the same panel:
+- **Car microphone** (default) — the QCar2's onboard mic. Talk to the car in
+  the room; no browser tab needed.
+- **This device's mic** — your laptop/phone streams audio to the car over the
+  existing WebSocket. Better range and quality. Browsers only grant mic
+  access over HTTPS or localhost, so over plain HTTP use the SSH tunnel in
+  §"Open the console from another laptop" and open `http://localhost:18080`.
+
+Both feed the same recogniser, so behaviour is identical either way.
+Everything runs **offline on the car** — no audio leaves the machine.
+
+Going to a named object computes a **standoff goal**: a free cell ~0.7 m
+short of the object, on the side you are approaching from, turned to face it.
+Sending the object's own coordinate would ask Nav2 to drive *into* the sofa.
+If that cell is blocked, it sweeps around the object until it finds a clear
+one, so a cooler wedged in a corner is still reachable. You can also just
+click any object in the **Objects** panel.
+
+### A5) Asking questions — "is there a cooler?", "how many chairs?"
+
+There is an **Ask** box in the console (type it), and the same questions work
+by voice once the mic is on. Questions are recognised as questions, so
+*"how far is the sofa"* is answered rather than obeyed as an order to drive
+there.
+
+```text
+"is there a cooler in the room"     -> Yes. The air cooler is 4.0 metres away, ahead and to your left.
+"how many chairs are there"         -> There are three chairs.
+"how far is the air cooler"         -> The air cooler is 4.0 metres away.
+"where is the desk"                 -> The desk is 3.0 metres away, to your right.
+"what can you see"                  -> I have mapped one air cooler, three chairs, and one desk.
+"how many people are there"         -> I can see two people right now.
+"how many people are there, go and check"  -> drives a sweep, then answers
+```
+
+**Answers come from the map, never from a language model.** Counts are
+counted from the landmark database; distances and directions are measured
+from the car's live pose. This matters: a small LLM asked *"how many chairs
+are in here"* will cheerfully invent a number, and a robot that makes up
+facts about its surroundings is worse than one that says it does not know.
+
+So the assistant is honest about its limits by design:
+- an object it has never seen gets *"I do not know what a helicopter is"*,
+  followed by what it **has** mapped — not a guess;
+- when the label is uncertain it says so: *"...though I am not certain; it
+  might be a bed"*;
+- **people are answered as "right now"**, from sightings in the last ~20 s,
+  never from the saved map — people walk away. If the cameras have not looked
+  recently it tells you the number is stale instead of passing it off as
+  current, and offers to go and check.
+- if it is not localised yet it says it cannot measure, rather than returning
+  a meaningless distance.
+
+**Optional local LLM.** `scripts/install_llm.sh` installs Ollama plus a small
+instruct model (~2 GB, runs on the Orin, nothing leaves the car). It is
+**not required** — without it the rule parser already handles the phrasings
+above. Its only job is to turn unusual wording into one of the known
+question types, and whatever it returns is validated against the real
+intents and object names before use. It can choose the *question*; it can
+never supply the *answer*.
+
+> **Live "go and check" needs a mode where the car may drive itself** — that
+> is autonomous mapping (`start_mapping_auto.sh`). In plain mapping or
+> navigation mode it will answer from what it can currently see instead of
+> setting off.
+
+### A6) How the map corrects itself
+
+Detections are not always right, so a landmark is treated as a running belief
+rather than a fixed record. Three things can be revised:
+
+| What | How |
+|---|---|
+| **The name** | Every sighting votes, weighted by how close it was. A chair first seen across the room as *"bed"* gets relabelled once nearer, clearer sightings outvote that. Watch for `relabelled "bed" -> "chair"` in the log. |
+| **The position** | Position is an average whose accumulated weight is **capped**, so it never becomes too rigid to fix. Without that cap, a hundred distant sightings would drown out a close-up correction; with it, one good close pass pulls the landmark to where the object really is. |
+| **Whether it exists at all** | If the car looks straight at where a landmark claims to be — in range, in view, and with the LiDAR showing clear space up to it — and repeatedly sees nothing, the landmark is deleted. That removes false positives and objects that have since been carried out of the room. |
+
+The occlusion check matters: without it the car would "disprove" the sofa
+every time someone walked in front of it.
+
+Objects also carry a `label_confidence` and the runner-up labels in the saved
+JSON, so you can see which ones were close calls.
+
+**Camera FOV calibrates itself.** Quanser publish no camera intrinsics and
+the CSI driver emits no `CameraInfo`, so `hfov_deg` starts as an educated
+guess — and every bearing, hence every object position, is only as good as
+that guess. But each detection that matched a LiDAR cluster is a free
+calibration sample: the bounding box gives the object's width in *pixels*,
+the LiDAR gives the same object's width in *angle*, and one divided by the
+other is the focal length. The median over ~60 such samples converges on the
+truth while you simply drive around, and the console shows the current value
+and its source. Samples where the cluster filled the search sector are
+discarded, since a clipped cluster would only re-derive the value already in
+use. Disable with `auto_calibrate_hfov:=false`.
 
 ### B) Navigate on a saved map (Navigation mode)
 ```bash
@@ -421,6 +675,55 @@ ros2 service call /local_costmap/clear_entirely_local_costmap nav2_msgs/srv/Clea
 ---
 
 ## 8. Troubleshooting
+
+### Object detection / voice
+
+- **"Object mapper is missing" or "Detector weights are missing" at launch** →
+  run `scripts/install_deps.sh`. The launcher checks up front on purpose, so
+  you find out before driving a whole mapping run, not at save time.
+- **No objects ever get mapped** → press **SHOW DETECTIONS** in the console.
+  - No boxes at all → the detector is not seeing your objects. Check the
+    `Objects` panel says *detector ready*, then add better labels to
+    `config/object_vocabulary.yaml` (concrete nouns work best).
+  - **Amber** boxes → detected, but the LiDAR returned no range in that
+    direction. That is the 2D-plane limitation: the object does not cross the
+    LiDAR's horizontal plane ~19 cm off the floor. Nothing is wrong; that
+    object simply cannot be placed geometrically.
+  - Boxes appear but nothing is saved → fewer than `min_hits` (3) sightings.
+    Drive past the object more slowly.
+- **Labels land next to the object, consistently offset left or right** →
+  that is the camera FOV assumption. Tune it:
+  `ros2 param set /qcar2_object_mapper hfov_deg 110.0` (no intrinsics are
+  published by the CSI driver, so this value is an estimate by design).
+- **Detection is slow / the car stutters** → lower the total rate:
+  `ros2 param set /qcar2_object_mapper detect_rate_hz 3.0`.
+- **The mic button does nothing / "sounddevice not installed"** → run
+  `scripts/install_deps.sh`. Check the car actually has a capture device with
+  `pactl list short sources | grep -v monitor`.
+- **Browser mic is refused** → browsers only allow microphone access over
+  HTTPS or localhost. Use the SSH tunnel and open `http://localhost:18080`,
+  or switch the source back to the car's own mic.
+- **It reacts to my normal conversation** → it should not; say *"hey car"*
+  first. If a bare **"stop"** is firing during chat and you would rather it
+  did not, start with `use_voice:=false`, or launch the node with
+  `emergency_stop_without_wake:=false`.
+- **"I do not know that object"** → the spoken name did not match anything on
+  the map. The console's `Objects` panel lists exactly what was mapped; add a
+  `synonyms:` entry in `config/object_vocabulary.yaml` for what you naturally
+  say.
+
+### Autonomous exploration
+
+- **The car does not move in auto mode** → it needs Nav2 *and* a map. The
+  script waits for `/qcar2_explorer`; if it aborts, check `ros2 node list` for
+  `bt_navigator` and `controller_server`. Also confirm E-STOP is not engaged.
+- **It stops early** → it finishes when no *reachable* frontier is left.
+  Frontiers that failed twice get blacklisted (Ackermann cars cannot reach
+  some spots). Check `visited`/`skipped` in the Auto explore panel.
+- **It never finishes** → the time budget (default 900 s) ends it. Raise
+  `TIME_BUDGET` at the top of `scripts/start_mapping_auto.sh`.
+
+### General
 
 - **The LiDAR keeps spinning after I stopped everything** → the node was killed
   before it could run `rplidar_close()`. Run `scripts/stop_lidar.sh`, which

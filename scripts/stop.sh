@@ -45,6 +45,11 @@ CMDLINE_PATTERNS=(
   "qcar2_rviz_gui/qcar2_goal_heading\.py"
   "qcar2_rviz_gui/qcar2_announcer\.py"
   "qcar2_rviz_gui/qcar2_web_gui\.py"
+  "qcar2_rviz_gui/qcar2_object_mapper\.py"
+  "qcar2_rviz_gui/qcar2_object_nav\.py"
+  "qcar2_rviz_gui/qcar2_voice_command\.py"
+  "qcar2_rviz_gui/qcar2_explorer\.py"
+  "qcar2_rviz_gui/qcar2_assistant\.py"
   "bin/ros2 launch qcar2_rviz_gui"
 )
 
