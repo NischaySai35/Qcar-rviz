@@ -12,11 +12,13 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
+                            LogInfo, OpaqueFunction)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from nav2_common.launch import RewrittenYaml
 
 def generate_launch_description():
@@ -51,12 +53,19 @@ def generate_launch_description():
                      '(disabled by default -- this car only needs the single '
                      'front preview below for a normal drive; pass '
                      'use_cameras:=true only if you actually want all four)')
+    # Was default 'true'. The RealSense D435 on top is the front camera in
+    # navigation now (use_realsense below), so the small CSI bumper camera is
+    # off by default; use_realsense:=false use_front_camera:=true brings the
+    # old setup back.
     declare_use_front_camera_cmd = DeclareLaunchArgument(
-        'use_front_camera', default_value='true',
-        description='Start the single front-camera preview relay shown in '
-                     'the RViz "Front Camera" panel. On by default -- it is '
-                     'just a display feed (no analysis), throttled to a few '
-                     'FPS, and costs one CSI camera instead of all four.')
+        'use_front_camera', default_value='false',
+        description='Start the small CSI bumper camera as the front view '
+                     '(only needed with use_realsense:=false)')
+    declare_use_realsense_cmd = DeclareLaunchArgument(
+        'use_realsense', default_value='true',
+        description='Use the RealSense D435 on top as the front camera: colour '
+                    'for the console and the vision model, depth for the '
+                    'distances drawn on the console view')
     declare_params_file_cmd = DeclareLaunchArgument(
         'params_file',
         default_value=os.path.join(qcar2_nodes_dir, 'config', 'qcar2_slam_and_nav.yaml'),
@@ -70,6 +79,13 @@ def generate_launch_description():
     declare_use_speed_slider_cmd = DeclareLaunchArgument(
         'use_speed_slider', default_value='false',
         description='Open the old Tk speed-limit window (the browser console has these controls)')
+    declare_use_llm_cmd = DeclareLaunchArgument(
+        'use_llm', default_value='true',
+        description='Run the local Cosmos-Reason2 vision-language model (llama-server) '
+                    'that the assistant uses for free-form questions and "what do you see"')
+    declare_llm_size_cmd = DeclareLaunchArgument(
+        'llm_size', default_value='2B',
+        description='Cosmos-Reason2 size: 2B (Q8, ~0.9 s per scene description) or 8B (Q4)')
 
     # Point bt_navigator at the Ackermann behavior tree.  The stock tree's
     # recovery RoundRobin contains <BackUp backup_dist="0.30">, which is what
@@ -106,6 +122,7 @@ def generate_launch_description():
             'use_sim_time': 'false',
             'autostart': autostart,
             'params_file': configured_params,
+            'log_level': 'error',       # see navigation_launch below
         }.items(),
     )
 
@@ -116,6 +133,10 @@ def generate_launch_description():
             'use_sim_time': 'false',
             'autostart': autostart,
             'params_file': configured_params,
+            # Errors only: Nav2 logs every replan ("Passing new path to
+            # controller", twice a second) and every slow control cycle.
+            # Real failures still print; the console shows nav state too.
+            'log_level': 'error',
         }.items(),
     )
 
@@ -183,7 +204,12 @@ def generate_launch_description():
         executable='qcar2_announcer.py',
         name='qcar2_announcer',
         output='screen',
-        parameters=[{'mode': 'navigation'}],
+        # Operator request (2026-10-05): no "television on the right" object
+        # callouts in navigation, and obstacle warnings only when something
+        # is genuinely close -- under 80 cm (node default is 1.5 m).
+        parameters=[{'mode': 'navigation',
+                     'announce_objects': False,
+                     'obstacle_distance': 0.8}],
     )
 
     # Ties "2D Pose Estimate" to cancelling the active goal and clearing the
@@ -244,12 +270,47 @@ def generate_launch_description():
     # nav limits, e-stop, cameras, voice, all over ROS 2 through this one
     # node.  Needs no DISPLAY -- open http://<car-ip>:<web_port> from any
     # laptop on the network.  See scripts/qcar2_web_gui.py and web/index.html.
+    # RealSense D435 (operator decision 2026-10-05: the top camera is the
+    # front camera in navigation). Colour + depth at 640x480 / 15 fps to keep
+    # USB and CPU load low; depth aligned to the colour image so a distance
+    # drawn at a pixel belongs to what is visible there. publish_tf off: its
+    # camera_link frames are not attached to base_link and would only clutter
+    # the TF tree.
+    use_realsense = LaunchConfiguration('use_realsense')
+    realsense_node = Node(
+        package='realsense2_camera', executable='realsense2_camera_node',
+        namespace='front', name='realsense', output='screen',
+        parameters=[{
+            'enable_color': True, 'enable_depth': True,
+            'enable_infra1': False, 'enable_infra2': False,
+            'enable_gyro': False, 'enable_accel': False,
+            'align_depth.enable': True, 'pointcloud.enable': False,
+            'rgb_camera.profile': '640x480x15', 'depth_module.profile': '640x480x15',
+            'publish_tf': False,
+        }],
+        condition=IfCondition(use_realsense),
+    )
+    # Distances on the console view + a clean copy for the vision model --
+    # see qcar2_depth_view.py.
+    depth_view_node = Node(
+        package='qcar2_rviz_gui', executable='qcar2_depth_view.py',
+        name='qcar2_depth_view', output='screen',
+        condition=IfCondition(use_realsense),
+    )
+    front_topic = PythonExpression([
+        "'/front/camera/depth_view' if '", use_realsense,
+        "' == 'true' else '/front/camera/csi_image'"])
+
     web_gui_node = Node(
         package='qcar2_rviz_gui',
         executable='qcar2_web_gui.py',
         name='qcar2_web_gui',
         output='screen',
-        parameters=[{'mode': 'navigation', 'port': LaunchConfiguration('web_port')}],
+        # See mapping.launch.py: true when this launch runs all four cameras,
+        # so the console never starts duplicates for the 360 view.
+        parameters=[{'mode': 'navigation', 'port': LaunchConfiguration('web_port'),
+                     'cameras_owned': ParameterValue(use_cameras, value_type=bool),
+                     'front_camera_topic': front_topic}],
         condition=IfCondition(LaunchConfiguration('use_web_gui')),
     )
 
@@ -273,12 +334,62 @@ def generate_launch_description():
         condition=IfCondition(use_speed_slider),
     )
 
+    # Local LLM + VLM in one process: llama.cpp's server with Cosmos-Reason2
+    # (Qwen-VL based) and its vision projector, fully on the GPU.  It is a
+    # plain HTTP server, not a ROS node -- qcar2_assistant.py talks to it on
+    # 127.0.0.1:8090 (NOT llama-server's default 8080, which is the web
+    # console's port).  Measured on this Orin with the 2B Q8 model, warm:
+    # scene description ~0.9 s, people count ~0.15 s, intent JSON ~0.5 s;
+    # ~3.6 s to load.  If the binary or model is missing the launch carries on
+    # without it and the assistant falls back to its rule parser.
+    def start_llm_server(context):
+        if LaunchConfiguration('use_llm').perform(context).lower() != 'true':
+            return []
+        size = LaunchConfiguration('llm_size').perform(context).upper()
+        quant = 'Q8_0' if size == '2B' else 'Q4_K_M'
+        models = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz',
+                              'models', 'cosmos-reason2')
+        binary = os.path.join(os.path.expanduser('~'), 'llama.cpp', 'build', 'bin', 'llama-server')
+        model = os.path.join(models, f'Cosmos-Reason2-{size}-{quant}.gguf')
+        mmproj = os.path.join(models, f'mmproj-Cosmos-Reason2-{size}-F16.gguf')
+        missing = [p for p in (binary, model, mmproj) if not os.path.isfile(p)]
+        if missing:
+            return [LogInfo(msg=f'[llm] Not starting the VLM, missing: {", ".join(missing)}. '
+                                'The assistant will use its rule parser only.')]
+        return [ExecuteProcess(
+            cmd=[binary, '-m', model, '--mmproj', mmproj,
+                 '-ngl', '99', '-c', '8192', '--host', '127.0.0.1', '--port', '8090'],
+            # Its per-request log goes to the launch log file, not the
+            # terminal, which would otherwise scroll with every question.
+            name='llama_server', output='log',
+        )]
+
+    # Speech-to-text for the sentence after "hey car" (qcar2_voice_command.py,
+    # TWO RECOGNISERS). whisper.cpp built for the Orin's GPU (sm_87 only) in
+    # ~/whisper.cpp/build-sm87; small.en, ~0.5 GB of GPU memory, ~0.26 s per
+    # sentence warm. Missing binary/model -> voice uses Vosk alone.
+    def start_whisper_server(context):
+        if LaunchConfiguration('use_voice').perform(context).lower() != 'true':
+            return []
+        root = os.path.join(os.path.expanduser('~'), 'whisper.cpp')
+        binary = os.path.join(root, 'build-sm87', 'bin', 'whisper-server')
+        model = os.path.join(root, 'models', 'ggml-small.en.bin')
+        missing = [p for p in (binary, model) if not os.path.isfile(p)]
+        if missing:
+            return [LogInfo(msg=f'[whisper] Not starting, missing: {", ".join(missing)}. '
+                                'Voice will use Vosk only.')]
+        return [ExecuteProcess(
+            cmd=[binary, '-m', model, '--host', '127.0.0.1', '--port', '8091'],
+            name='whisper_server', output='log',
+        )]
+
     def validate_map_file(context):
         path = map_yaml_file.perform(context)
         if not path or not os.path.isfile(path):
             raise RuntimeError(
                 'Navigation needs an existing saved map YAML. Run mapping and '
-                'scripts/save_map.sh first, then pass map:=/absolute/path/map.yaml.')
+                'let it autosave (scripts/start_mapping.sh NAME) first, then pass '
+                'map:=/absolute/path/map.yaml.')
         return []
 
     return LaunchDescription([
@@ -288,11 +399,18 @@ def generate_launch_description():
         declare_use_rviz_cmd,
         declare_use_cameras_cmd,
         declare_use_front_camera_cmd,
+        declare_use_realsense_cmd,
+        realsense_node,
+        depth_view_node,
         declare_params_file_cmd,
         declare_autostart_cmd,
         declare_use_speed_slider_cmd,
         declare_use_voice_cmd,
+        declare_use_llm_cmd,
+        declare_llm_size_cmd,
         OpaqueFunction(function=validate_map_file),
+        OpaqueFunction(function=start_llm_server),
+        OpaqueFunction(function=start_whisper_server),
         hardware_launch,
         odometry_launch,
         localization_launch,

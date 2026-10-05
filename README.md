@@ -68,7 +68,7 @@ Qcar-rviz/
 ├── maps/                      <- saved maps land here (.yaml + .pgm, plus
 │                                 <name>_objects.json for the object labels)
 ├── models/                    <- downloaded YOLO-World + Vosk weights
-│                                 (gitignored; scripts/install_deps.sh fetches)
+│                                 (gitignored; see "Setup" in Quick Start)
 ├── scripts/                   <- shell scripts, see Quick Start
 └── archive/                   <- your two earlier attempts, kept for
     ├── QCar_Navigation_standalone_opencv/   reference, not used anymore
@@ -251,16 +251,46 @@ scripts/build.sh
 This compiles the driver, cartographer, rf2o and the new GUI package. Takes
 a few minutes the first time (rebuilds are much faster).
 
-### One-time setup: object detection + voice commands
+### Setup: object detection + voice commands (already done on this car)
+Only needed on a fresh machine. Everything installs with `--no-deps` into
+`/usr/bin/python3`, because this car's `torch` is NVIDIA's Jetson build and a
+dependency resolver would happily replace it with a generic wheel with no CUDA.
 ```bash
-scripts/install_deps.sh
+cd ~/Desktop/Qcar-rviz && mkdir -p models
+# detector: ultralytics 8.2.x + CLIP text encoder
+/usr/bin/python3 -m pip install --no-deps "ultralytics==8.2.101"
+/usr/bin/python3 -m pip install --no-deps "git+https://github.com/ultralytics/CLIP.git" ftfy regex
+curl -fL -o models/yolov8l-worldv2.pt \
+  https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8l-worldv2.pt
+/usr/bin/python3 -c "import clip; clip.load('ViT-B/32', device='cpu')"   # caches CLIP weights
+# voice: Vosk + audio input
+sudo apt-get install -y libportaudio2
+/usr/bin/python3 -m pip install --no-deps vosk sounddevice cffi srt
+curl -fL -o /tmp/vosk.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+unzip -q /tmp/vosk.zip -d models && rm /tmp/vosk.zip
 ```
-Installs the CLIP text encoder, `vosk` + `sounddevice`, and downloads the
-YOLO-World and speech models into `models/`. Safe to re-run — every step
-checks first and skips what is already done. It deliberately installs with
-`--no-deps` into `/usr/bin/python3`, because this car's `torch` is NVIDIA's
-Jetson build and a dependency resolver would happily replace it with a
-generic wheel that has no CUDA.
+Vision-language model for "what do you see" and free-form questions
+(Cosmos-Reason2 on llama.cpp, fully on the Orin GPU, nothing leaves the car).
+Already set up on this car: llama.cpp is built with CUDA in `~/llama.cpp`, and
+the models are in `models/cosmos-reason2/`. On a fresh machine:
+```bash
+git clone https://github.com/ggml-org/llama.cpp ~/llama.cpp
+cmake -S ~/llama.cpp -B ~/llama.cpp/build -DGGML_CUDA=ON && cmake --build ~/llama.cpp/build -j8 --target llama-server
+mkdir -p models/cosmos-reason2 && cd models/cosmos-reason2
+# 2B (default, ~3 GB): Cosmos-Reason2-2B-Q8_0.gguf + mmproj-Cosmos-Reason2-2B-F16.gguf
+# 8B (optional, ~6 GB): from huggingface.co/apolo13x/Cosmos-Reason2-8B-GGUF
+curl -fLO https://huggingface.co/apolo13x/Cosmos-Reason2-8B-GGUF/resolve/main/Cosmos-Reason2-8B-Q4_K_M.gguf
+curl -fLO https://huggingface.co/apolo13x/Cosmos-Reason2-8B-GGUF/resolve/main/mmproj-Cosmos-Reason2-8B-F16.gguf
+```
+`start_navigate.sh` starts it automatically (`llama-server` on
+`127.0.0.1:8090`; port 8080 is the console). `llm_size:=8B` picks the larger
+model, `use_llm:=false` skips it.
+
+**Why YOLO-World v2 *Large*** (2026-09-25, 150 COCO indoor photos, this car's
+vocabulary): precision/recall 0.76/0.64 vs 0.69/0.55 for the small model it
+replaced, at 50 ms vs 28 ms per frame on the Orin. The newer YOLOE-26 family
+was also tested (0.66/0.64): far better at people, but worse at TVs and
+sofas, which are what the map is for.
 
 ### Every terminal you open for this project, first run:
 ```bash
@@ -273,24 +303,46 @@ change your `.bashrc`.)
 
 ### Open the console from another laptop
 
-Use the Orin's LAN address from the launcher output:
+Every launcher (`start_mapping.sh`, `start_mapping_auto.sh`,
+`start_navigate.sh`) prints these lines at startup with the car's **current**
+IP already filled in, so copying from that output is always right:
 ```text
-http://10.206.234.236:8080
+Console URL: http://<car-ip>:8080
+On the Orin: http://localhost:8080
+Laptop localhost tunnel: ssh -N -L 18080:127.0.0.1:8080 nvidia@<car-ip>
+Then open http://localhost:18080 on the laptop.
 ```
-The separator before `8080` is a **colon**, not a dot. If you specifically
-want to use a localhost URL in the laptop browser, run this command
-in a terminal on the laptop and leave it running:
+The Orin's Wi-Fi address changes between networks/reboots (it was
+`10.206.234.236`, it is `10.104.187.236` as of 2026-10-05). To check it, on
+the Orin run:
 ```bash
-ssh -N -L 18080:127.0.0.1:8080 nvidia@10.206.234.236
+ip -4 -o addr show wlan0 | awk '{print $4}'     # e.g. 10.104.187.236/24 -> use 10.104.187.236
+```
+**Direct (no tunnel)** — in the laptop browser:
+```text
+http://10.104.187.236:8080
+```
+The separator before `8080` is a **colon**, not a dot.
+
+**Localhost tunnel** — needed for the browser microphone (browsers only allow
+mic access over HTTPS or localhost). In a terminal **on the laptop** (external
+cmd / PowerShell / Terminal), run this and leave it running:
+```bash
+ssh -N -L 18080:127.0.0.1:8080 nvidia@10.104.187.236
 ```
 Then open `http://localhost:18080` on the laptop. `18080` is the laptop-side
-port; the Orin-side console remains on port `8080`. Replace the IP if the
-Orin's Wi-Fi address changes.
+port; the Orin-side console stays on port `8080`. `-N` means the window just
+sits there with no prompt — that is normal; closing it closes the tunnel.
+If you launched with `web_port:=<n>`, replace `8080` with `<n>` in both
+commands.
 
 ### A) Build a new map (Mapping mode)
 ```bash
-scripts/start_mapping.sh
+scripts/start_mapping.sh my_room     # name optional; default map_<date>_<time>
 ```
+**The map autosaves every 10 s** to `maps/my_room.yaml` / `.pgm` /
+`my_room_objects.json`, overwriting the same files as you drive. Ctrl+C just
+stops everything within ~2 s; the latest autosave is your map.
 - `scripts/startmapping.sh` is also supported as a compatibility alias.
 - The **QCar2 Map Drive Console** opens automatically. Click and hold its
   direction buttons, or hold **W/A/S/D** (or the arrow keys), to move.
@@ -314,13 +366,8 @@ scripts/start_mapping.sh
   does not create camera image panels: this QCar computer's OpenGL driver
   crashes RViz when those extra render windows are present. The drive console
   is a separate desktop window, not an RViz panel.
-- When you're happy with the map, **in a second terminal** (don't close the
-  mapping one yet):
-  ```bash
-  cd ~/Desktop/Qcar-rviz && source scripts/env.sh
-  scripts/save_map.sh my_room      # saves maps/my_room.yaml + .pgm
-  ```
-- Then Ctrl+C the mapping terminal.
+- When you're happy with the map, press **Ctrl+C** — it was already saved
+  within the last 10 s.
 
 Useful flags:
 ```bash
@@ -329,8 +376,11 @@ scripts/start_mapping.sh use_rviz:=false        # headless, no GUI
 scripts/start_mapping.sh use_drive_gui:=false   # no desktop drive console
 scripts/start_mapping.sh sensor_fusion:=false   # LiDAR-only mapping (no wheel-encoder/IMU odometry)
 scripts/start_mapping.sh detect_objects:=false  # skip object labelling (no cameras, no GPU load)
-scripts/start_mapping.sh use_voice:=false       # do not start the voice listener at all
 ```
+Mapping only maps (SLAM + object labels, plus Nav2 and the explorer in auto
+mode). Voice commands, questions, "go to the sofa" and spoken announcements
+are **navigation-only** — they need the finished map, and running them while
+mapping only took CPU from SLAM.
 
 `sensor_fusion` is **on by default**: it starts Cartographer four seconds
 later so the motor encoder and IMU streams are already publishing. The map
@@ -436,7 +486,8 @@ same impossible question forever.
 
 You stay in control the whole time at `http://<car-ip>:8080`: **E-STOP**
 pauses it, the drive pad overrides it, **PAUSE EXPLORING** holds it, and
-`Ctrl+C` saves the map built so far before shutting down. Default time budget
+`Ctrl+C` stops at once (the map autosaves every 10 s, so you keep it); a
+finished run saves once more and shuts itself down. Default time budget
 is 900 s (`TIME_BUDGET` at the top of the script).
 
 ### A4) Voice commands — "hey car, go to the air cooler"
@@ -502,41 +553,41 @@ there.
 "how many chairs are there"         -> There are three chairs.
 "how far is the air cooler"         -> The air cooler is 4.0 metres away.
 "where is the desk"                 -> The desk is 3.0 metres away, to your right.
-"what can you see"                  -> I have mapped one air cooler, three chairs, and one desk.
-"how many people are there"         -> I can see two people right now.
-"how many people are there, go and check"  -> drives a sweep, then answers
+"what objects have you mapped"      -> I have mapped one air cooler, three chairs, and one desk.
+"what time is it"                   -> It is 8:05 AM, Monday the 5th of October.
+"what do you see"                   -> (camera) I see a person standing with a lanyard and another
+                                       sitting at a desk with a laptop.
+"can you see a laptop"              -> (camera) I see a silver laptop with a Dell logo ...
+"how many people are here"          -> (camera) Looking ahead, I can see two people.
+"what can you do" / "tell me a joke" -> answered by the model
 ```
 
-**Answers come from the map, never from a language model.** Counts are
-counted from the landmark database; distances and directions are measured
-from the car's live pose. This matters: a small LLM asked *"how many chairs
-are in here"* will cheerfully invent a number, and a robot that makes up
-facts about its surroundings is worse than one that says it does not know.
+**Where each answer comes from** (fastest first; the first that applies wins):
+1. **Rules, no model** (instant): go-to commands, time/date, and the map
+   questions. Counts are counted from the landmark database; distances and
+   directions are measured from the car's live pose. The map always wins
+   when it has the answer.
+2. **Front camera + Cosmos-Reason2** (~0.3–2 s): "what do you see", "can you
+   see …", colours, people in view (navigation mode runs no detector), and
+   objects that are not on the map.
+3. **The model on its own** (~1–2 s): phrasings the rules do not cover are
+   classified by the model; anything else it answers directly.
 
-So the assistant is honest about its limits by design:
-- an object it has never seen gets *"I do not know what a helicopter is"*,
-  followed by what it **has** mapped — not a guess;
-- when the label is uncertain it says so: *"...though I am not certain; it
-  might be a bed"*;
-- **people are answered as "right now"**, from sightings in the last ~20 s,
-  never from the saved map — people walk away. If the cameras have not looked
-  recently it tells you the number is stale instead of passing it off as
-  current, and offers to go and check.
+**The model can be wrong.** In testing the 2B model reported "one bottle"
+where there was none, and before it was given facts about itself it called
+the QCar "an electric vehicle for urban environments". Treat camera and chat
+answers as its best guess; map answers are measured.
+
+Other honesty rules that still hold:
+- when a mapped label is uncertain it says so: *"...though I am not certain;
+  it might be a bed"*;
 - if it is not localised yet it says it cannot measure, rather than returning
-  a meaningless distance.
+  a meaningless distance;
+- with no model server (`use_llm:=false`, or still loading) it answers map
+  and time questions only, and says the vision model is not running.
 
-**Optional local LLM.** `scripts/install_llm.sh` installs Ollama plus a small
-instruct model (~2 GB, runs on the Orin, nothing leaves the car). It is
-**not required** — without it the rule parser already handles the phrasings
-above. Its only job is to turn unusual wording into one of the known
-question types, and whatever it returns is validated against the real
-intents and object names before use. It can choose the *question*; it can
-never supply the *answer*.
-
-> **Live "go and check" needs a mode where the car may drive itself** — that
-> is autonomous mapping (`start_mapping_auto.sh`). In plain mapping or
-> navigation mode it will answer from what it can currently see instead of
-> setting off.
+> **"Go around the room and …" is not built yet** (Phase 2). For now the car
+> says so and answers from its current view instead.
 
 ### A6) How the map corrects itself
 
@@ -573,8 +624,8 @@ scripts/start_navigate.sh map:=/home/nvidia/Desktop/Qcar-rviz/maps/my_room.yaml
 ```
 (With no `map:=...` argument, the launcher uses the first `.yaml` map in
 `maps/` alphabetically. A supplied `map:=...` always takes priority. If the
-folder is empty, it prints a clear error; first complete a mapping run and
-save one with `scripts/save_map.sh`.)
+folder is empty, it prints a clear error; first do a mapping run — it
+autosaves as it goes.)
 
 - RViz opens with the saved map loaded.
 - RViz initially seeds AMCL at `(0, 0)` only so the `map` frame and saved map
@@ -612,8 +663,10 @@ save one with `scripts/save_map.sh`.)
 
 ### Stopping mapping/navigation — and the spinning-LiDAR problem
 
-**Normal stop: press `Ctrl+C` once in the launch terminal, then wait.**
-Do *not* press it repeatedly, and do *not* close the terminal window.
+**Normal stop: press `Ctrl+C` once in the launch terminal.** Everything is
+down within about 2 s. It does not save anything itself; mapping has
+already autosaved within the last 10 s.
+Do *not* close the terminal window instead.
 
 Why this matters: the LiDAR motor is spun down by a `rplidar_close()` call at
 the very end of the lidar node's main loop (`qcar2_nodes/src/lidar.cpp`). That
@@ -625,31 +678,25 @@ spin state lives in the device, not in the process.
 
 If `Ctrl+C` doesn't work or nodes are stuck, use the stop script from another
 terminal. It sends `SIGINT` first and only escalates to `SIGKILL` for anything
-still alive after 8 seconds:
+still alive after 3 seconds:
 
 ```bash
 scripts/stop.sh
 ```
 
-If the LiDAR is *already* spinning after an unclean kill, no amount of further
-killing will help — there is no process left to signal. Re-open the device and
-close it properly instead:
+If anything had to be `SIGKILL`ed, `stop.sh` then spins the LiDAR down by
+itself: it briefly restarts the lidar node and sends it a clean `SIGINT`, so
+`rplidar_close()` actually runs. If the LiDAR is *already* spinning with
+nothing running (e.g. after closing a terminal), just do the spin-down:
 
 ```bash
-scripts/stop_lidar.sh
+scripts/stop.sh --lidar
+scripts/stop.sh --hard   # skip the grace period (then spins the LiDAR down)
 ```
 
-That briefly restarts the lidar node and sends it a clean `SIGINT`, so
-`rplidar_close()` actually runs. If it is *still* spinning after that, the only
-remaining option is to power-cycle the QCar2.
-
-```bash
-scripts/stop.sh --hard   # skip the grace period; leaves the LiDAR spinning
-                         # (follow with scripts/stop_lidar.sh)
-```
-
-Both scripts match ROS node **process names** only, so they are safe to run
-while a `colcon build` is in progress.
+If it is *still* spinning after that, power-cycle the QCar2. `stop.sh`
+matches ROS node **process names** only, so it is safe to run while a
+`colcon build` is in progress.
 
 ### Rebuilding after you edit anything in `qcar2_rviz_gui`
 ```bash
@@ -679,7 +726,7 @@ ros2 service call /local_costmap/clear_entirely_local_costmap nav2_msgs/srv/Clea
 ### Object detection / voice
 
 - **"Object mapper is missing" or "Detector weights are missing" at launch** →
-  run `scripts/install_deps.sh`. The launcher checks up front on purpose, so
+  see "Setup" in section 6. The launcher checks up front on purpose, so
   you find out before driving a whole mapping run, not at save time.
 - **No objects ever get mapped** → press **SHOW DETECTIONS** in the console.
   - No boxes at all → the detector is not seeing your objects. Check the
@@ -697,9 +744,9 @@ ros2 service call /local_costmap/clear_entirely_local_costmap nav2_msgs/srv/Clea
   published by the CSI driver, so this value is an estimate by design).
 - **Detection is slow / the car stutters** → lower the total rate:
   `ros2 param set /qcar2_object_mapper detect_rate_hz 3.0`.
-- **The mic button does nothing / "sounddevice not installed"** → run
-  `scripts/install_deps.sh`. Check the car actually has a capture device with
-  `pactl list short sources | grep -v monitor`.
+- **The mic button does nothing / "sounddevice not installed"** → see
+  "Setup" in section 6. The car's mics are the `alsa_input.hw_1_1` source
+  (DMIC2); check it exists with `pactl list short sources`.
 - **Browser mic is refused** → browsers only allow microphone access over
   HTTPS or localhost. Use the SSH tunnel and open `http://localhost:18080`,
   or switch the source back to the car's own mic.
@@ -726,25 +773,30 @@ ros2 service call /local_costmap/clear_entirely_local_costmap nav2_msgs/srv/Clea
 ### General
 
 - **The LiDAR keeps spinning after I stopped everything** → the node was killed
-  before it could run `rplidar_close()`. Run `scripts/stop_lidar.sh`, which
+  before it could run `rplidar_close()`. Run `scripts/stop.sh --lidar`, which
   re-opens the device and shuts it down properly. To avoid it next time, press
   `Ctrl+C` **once** and wait, or use `scripts/stop.sh` — closing the terminal
   or hammering `Ctrl+C` forces a `SIGKILL` that skips the spin-down. See
   "Stopping mapping/navigation" in section 6.
 - **Nodes won't die / a launch is stuck** → `scripts/stop.sh` (graceful, waits
-  8 s), then `scripts/stop.sh --hard` if something is truly wedged.
+  up to 3 s), then `scripts/stop.sh --hard` if something is truly wedged.
 - **RViz is black at startup** → the old profile used `map` as its fixed
   frame, which does not exist until SLAM/localization publishes it. The
   supplied profile now starts in `base_link`, so its grid and QCar model are
   visible immediately. Close any old RViz window and relaunch using the
   project scripts (or reload `qcar2_full_gui.rviz` from RViz's File menu).
 - **No map in navigation mode** → mapping has not produced a saved map yet.
-  Run `scripts/save_map.sh my_room` while mapping, then start navigation with
+  Run `scripts/start_mapping.sh my_room`, Ctrl+C when done, then start navigation with
   `scripts/start_navigate.sh map:=$PWD/maps/my_room.yaml`. The launcher now
   stops with a clear message instead of opening a misleading empty view.
 - **RViz shows nothing / no TF** → make sure `scripts/start_mapping.sh` or
   `start_navigate.sh` is actually still running in its terminal and hasn't
   crashed; check that terminal's output for errors.
+- **Every camera fails with "The video format is not supported"** (and the
+  csi nodes keep restarting) → over SSH this is usually a wrong `DISPLAY`
+  (already forced to `:0` in the launch files). If it persists, the camera
+  daemon has wedged — typically after camera nodes were force-killed:
+  `sudo systemctl restart nvargus-daemon`, then relaunch.
 - **Camera panels blank** → the CSI ribbon cables can be finicky; check
   `ros2 topic hz /front/camera/csi_image` etc. Try `use_cameras:=false`
   then re-enable one at a time if one camera is misbehaving.

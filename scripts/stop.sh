@@ -6,15 +6,62 @@
 # SIGINT (same as Ctrl+C) first and gives the nodes time to shut down properly.
 # Only processes still alive after the grace period get SIGKILLed.
 #
+# If anything had to be SIGKILLed, the LiDAR spin-down is run automatically
+# afterwards (see spin_down_lidar below).
+#
 # Usage:  scripts/stop.sh          (graceful, recommended)
-#         scripts/stop.sh --hard   (skip straight to SIGKILL - leaves the
-#                                   LiDAR spinning; use scripts/stop_lidar.sh
-#                                   afterwards to spin it down)
+#         scripts/stop.sh --hard   (SIGKILL straight away, then spin the
+#                                   LiDAR down)
+#         scripts/stop.sh --lidar  (nothing running but the LiDAR is still
+#                                   spinning, e.g. after a closed terminal:
+#                                   just spin it down)
 set -u
 
-GRACE_SECONDS=8
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Was 8. Every node here exits on SIGINT in about a second; anything still
+# alive after 3 s is stuck, and waiting longer only delays the SIGKILL.
+GRACE_SECONDS=3
 HARD=0
 [ "${1:-}" = "--hard" ] && HARD=1
+
+# The RPLIDAR's motor keeps spinning until something sends it a stop command
+# over serial, and that command lives in rplidar_close() at the end of the
+# lidar node. A SIGKILLed node never runs it, and there is then no process
+# left to kill -- so briefly re-open the device and close it PROPERLY: start
+# the lidar node, let it enter its read loop, then SIGINT it.
+spin_down_lidar() {
+  if pgrep -x 'lidar' >/dev/null 2>&1; then
+    echo "[stop.sh] A lidar node is still running. Stopping it cleanly first..."
+    pkill -INT -x 'lidar'
+    sleep 5
+    pkill -9 -x 'lidar' 2>/dev/null
+    sleep 1
+  fi
+  echo "[stop.sh] Re-opening the LiDAR so it can be shut down properly..."
+  env -i HOME="$HOME" USER="$USER" \
+    PATH="/usr/bin:/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/sbin" \
+    bash -c "
+      source /opt/ros/humble/setup.bash
+      source '$PROJECT_DIR/qcar2_ws/install/setup.bash'
+      ros2 run qcar2_nodes lidar > /tmp/qcar2_stop_lidar.log 2>&1 &
+      NODE_PID=\$!
+      # SIGINT before the driver is in its read loop would skip the close path.
+      sleep 5
+      kill -INT \$NODE_PID 2>/dev/null
+      for _ in \$(seq 10); do
+        kill -0 \$NODE_PID 2>/dev/null || break
+        sleep 1
+      done
+      kill -9 \$NODE_PID 2>/dev/null
+    "
+  echo "[stop.sh] LiDAR spin-down done. If it is STILL spinning, power-cycle the QCar2"
+  echo "          (the motor state lives in the device)."
+}
+
+if [ "${1:-}" = "--lidar" ]; then
+  spin_down_lidar
+  exit 0
+fi
 
 # Matched against the process NAME only (pgrep -x), never the full command
 # line. Matching command lines with `pgrep -f` is dangerous here: while
@@ -28,6 +75,7 @@ EXEC_NAMES=(
   'controller_server' 'planner_server' 'bt_navigator' 'behavior_server'
   'smoother_server' 'velocity_smoother' 'waypoint_follower'
   'collision_monitor' 'lifecycle_manager' 'map_server' 'amcl' 'rviz2'
+  'llama-server' 'whisper-server'
 )
 
 # Python nodes all run as "python3", so they must be matched on the command
@@ -86,9 +134,10 @@ done
 
 if [ "$HARD" -eq 1 ]; then
   echo "[stop.sh] --hard: sending SIGKILL immediately."
-  echo "[stop.sh] WARNING: the LiDAR will keep spinning. Run scripts/stop_lidar.sh next."
   # shellcheck disable=SC2086
   kill -9 $PIDS 2>/dev/null
+  sleep 1
+  spin_down_lidar
   exit 0
 fi
 
@@ -96,25 +145,35 @@ echo "[stop.sh] Sending SIGINT (clean shutdown, spins the LiDAR down)..."
 # shellcheck disable=SC2086
 kill -INT $PIDS 2>/dev/null
 
-for i in $(seq "$GRACE_SECONDS"); do
-  sleep 1
+# Poll every 0.25 s rather than 1 s: most nodes exit well inside a second,
+# and waiting out whole seconds is what made stopping feel sluggish.
+for i in $(seq $((GRACE_SECONDS * 4))); do
+  sleep 0.25
   REMAINING=$(collect_pids)
   if [ -z "$REMAINING" ]; then
-    echo "[stop.sh] All nodes exited cleanly after ${i}s. LiDAR spun down."
+    echo "[stop.sh] All nodes exited cleanly after $(awk "BEGIN{print $i/4}")s. LiDAR spun down."
     exit 0
   fi
 done
 
 REMAINING=$(collect_pids)
 echo "[stop.sh] These did not exit within ${GRACE_SECONDS}s, forcing SIGKILL:"
+LIDAR_KILLED=0
 for pid in $REMAINING; do
-  echo "   $pid  $(ps -p "$pid" -o comm= 2>/dev/null)"
+  name="$(ps -p "$pid" -o comm= 2>/dev/null)"
+  echo "   $pid  $name"
+  [ "$name" = "lidar" ] && LIDAR_KILLED=1
 done
 # shellcheck disable=SC2086
 kill -9 $REMAINING 2>/dev/null
-sleep 1
+sleep 0.2
 
-if pgrep -x 'lidar' >/dev/null 2>&1 || [ -n "$REMAINING" ]; then
-  echo "[stop.sh] A node had to be killed, so the LiDAR may still be spinning."
-  echo "[stop.sh] If you can still hear it: scripts/stop_lidar.sh"
+# Only the lidar node's OWN clean exit spins the motor down, so the (10 s)
+# spin-down is needed only if that process was the one force-killed -- not
+# because some unrelated Python node was slow to exit.
+if [ "$LIDAR_KILLED" -eq 1 ]; then
+  echo "[stop.sh] The lidar node had to be killed, so the LiDAR may still be spinning."
+  spin_down_lidar
+else
+  echo "[stop.sh] Done (LiDAR exited cleanly and is spun down)."
 fi

@@ -87,6 +87,39 @@ def normalize(text):
     return text
 
 
+def number_names(objects):
+    """sofa, sofa 2, sofa 3 -- same rule as qcar2_object_mapper.py's copy.
+
+    Applied again on load so maps saved before numbering existed get names
+    too; ordered by id, so the numbers are the same every run.
+    """
+    seen = {}
+    for o in sorted(objects, key=lambda o: (o['label'], o.get('id', 0))):
+        n = seen[o['label']] = seen.get(o['label'], 0) + 1
+        o['name'] = o['label'] if n == 1 else f"{o['label']} {n}"
+    return objects
+
+
+NUMBER_WORDS = {'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6,
+                'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+                'first': 1, 'second': 2, 'third': 3, 'fourth': 4, 'fifth': 5,
+                'sixth': 6, 'seventh': 7, 'eighth': 8, 'ninth': 9, 'tenth': 10}
+_NUM = r'(\d+|' + '|'.join(NUMBER_WORDS) + r')'
+
+
+def split_number(q):
+    """'sofa 2' / 'sofa two' / 'second sofa' -> ('sofa', 2); else (q, None)."""
+    m = re.match(rf'^(.+?)\s+(?:number\s+)?{_NUM}$', q) or None
+    if m:
+        base, num = m.group(1), m.group(2)
+    else:
+        m = re.match(rf'^{_NUM}\s+(.+)$', q)
+        if not m:
+            return q, None
+        num, base = m.group(1), m.group(2)
+    return base, int(num) if num.isdigit() else NUMBER_WORDS[num]
+
+
 def yaw_to_quaternion(yaw):
     return math.sin(yaw / 2.0), math.cos(yaw / 2.0)
 
@@ -165,7 +198,7 @@ class ObjectNav(Node):
         except (OSError, ValueError) as exc:
             self.get_logger().error(f'Could not read {path}: {exc}')
             return
-        self.objects = data.get('objects') or []
+        self.objects = number_names(data.get('objects') or [])
         self.synonyms = {k.lower(): v for k, v in (data.get('synonyms') or {}).items()}
         labels = sorted({o['label'] for o in self.objects})
         self.get_logger().info(
@@ -185,7 +218,7 @@ class ObjectNav(Node):
         # Only take over from the file once the mapper actually has something,
         # so an empty startup publish cannot wipe a good loaded map.
         if objects:
-            self.objects = objects
+            self.objects = number_names(objects)
 
     def on_costmap(self, msg):
         self.costmap = msg
@@ -277,22 +310,32 @@ class ObjectNav(Node):
         query = msg.data or ''
         if not self.objects:
             return self.fail(query, 'No objects are mapped. Map with detect_objects:=true first.')
-        label = self.match(query)
+        # "sofa 2" / "sofa two" / "second sofa" names one specific object.
+        base, number = split_number(normalize(query))
+        label = self.match(base)
         if label is None:
             known = sorted({o['label'] for o in self.objects})
             return self.fail(query, f'I do not know "{normalize(query)}". '
                                     f'Mapped objects: {", ".join(known)}')
 
         candidates = [o for o in self.objects if o['label'] == label]
+        if number is not None:
+            want = label if number == 1 else f'{label} {number}'
+            exact = [o for o in candidates if o.get('name') == want]
+            if not exact:
+                names = ', '.join(o.get('name', label) for o in candidates)
+                return self.fail(query, f'There is no {want}. I have: {names}.')
+            candidates = exact
         car = self.car_xy()
         if car and len(candidates) > 1:
-            # Several of the same thing: mean the closest one.
+            # Several of the same thing and no number given: the closest one.
             candidates.sort(key=lambda o: math.hypot(o['x'] - car[0], o['y'] - car[1]))
         target = candidates[0]
+        name = target.get('name', label)
 
         goal = self.standoff_goal(target)
         if goal is None:
-            return self.fail(query, f'I found the {label} but there is no clear space '
+            return self.fail(query, f'I found the {name} but there is no clear space '
                                     f'to stop near it.')
         gx, gy, yaw, dist = goal
 
@@ -304,12 +347,12 @@ class ObjectNav(Node):
         pose.pose.orientation.z, pose.pose.orientation.w = z, w
         self.goal_pub.publish(pose)
 
-        self.say(f'Going to the {label}')
+        self.say(f'Going to the {name}')
         self.get_logger().info(
-            f'"{query}" -> {label} at ({target["x"]:.2f}, {target["y"]:.2f}); '
+            f'"{query}" -> {name} at ({target["x"]:.2f}, {target["y"]:.2f}); '
             f'goal ({gx:.2f}, {gy:.2f}) standoff {dist:.2f} m')
         self.publish_status({
-            'ok': True, 'query': query, 'label': label,
+            'ok': True, 'query': query, 'label': label, 'name': name,
             'object': {'x': target['x'], 'y': target['y']},
             'goal': {'x': round(gx, 3), 'y': round(gy, 3), 'yaw': round(yaw, 3)},
             'alternatives': len(candidates),
@@ -373,7 +416,7 @@ class ObjectNav(Node):
             text.pose.orientation.w = 1.0
             text.scale = Vector3(x=0.0, y=0.0, z=0.18)
             text.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.95)
-            text.text = obj['label']
+            text.text = obj.get('name', obj['label'])
             text.lifetime = DurationMsg(sec=0)
             array.markers.append(text)
         self.marker_pub.publish(array)

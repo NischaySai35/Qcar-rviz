@@ -1,7 +1,7 @@
 image: my_room5.pgm
 mode: trinary
-resolution: 0.05
-origin: [-1.36, -8.5, 0]
+resolution: 0.050
+origin: [-9.498, -10.150, 0]
 negate: 0
 occupied_thresh: 0.65
 free_thresh: 0.25

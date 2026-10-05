@@ -11,14 +11,17 @@
 #   3. qcar2_explorer.py repeatedly picks the best frontier (the boundary
 #      between mapped and unknown space) and sends the car there, until the
 #      room is covered, nothing reachable is left, or the time budget expires.
-#   4. The map AND the detected objects are saved automatically.
-#   5. Everything is shut down cleanly, including spinning the LiDAR down.
+#   4. The map + objects are AUTOSAVED to maps/<map_name>.yaml/.pgm/
+#      _objects.json every 10 s (same files overwritten), and saved once
+#      more when exploration FINISHES.
+#   5. Then everything shuts down by itself, LiDAR spun down, and this
+#      script exits -- ready for scripts/start_navigate.sh.
 #
 # Watch it from http://<car-ip>:8080 while it runs. You can take over at any
 # time: the E-STOP button pauses it, the drive pad overrides it.
 #
-# Ctrl+C is safe at any point -- the map saved so far is written out first,
-# then everything is stopped, and the car is left with no goal executing.
+# Ctrl+C stops everything immediately (~2 s); the last autosave (<= 10 s
+# old) is what you keep.
 set -u
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,36 +37,20 @@ STARTUP_TIMEOUT=120      # max wait for the hardware node
 NAV_TIMEOUT=90           # max extra wait for Nav2 to activate
 # ----------------------------------------------------------------------------
 
-MAP_PGID=""
-SAVED=false
+MAP_PID=""
 
-save_everything() {
-  # Guard against running twice (Ctrl+C during the normal save path).
-  if [ "$SAVED" = true ]; then return 0; fi
-  SAVED=true
-  # If the run aborted before mapping ever started there is nothing to save,
-  # and attempting it buries the REAL error (usually a launch failure further
-  # up) under a scary-looking map_saver stack. save_map.sh exits 3 for
-  # "nothing to save", which is not a failure worth shouting about.
-  echo "[auto] Saving map as '$MAP_NAME' ..."
-  local rc=0
-  "$PROJECT_DIR/scripts/save_map.sh" "$MAP_NAME" || rc=$?
-  if [ "$rc" -eq 3 ]; then
-    echo "[auto] Nothing was mapped, so nothing was saved."
-    echo "[auto] Look further up for why the stack did not start."
-  elif [ "$rc" -ne 0 ]; then
-    echo "[auto] WARNING: map save failed (exit $rc)." >&2
-  fi
-}
-
+# Stopping = signal start_mapping.sh, which takes the whole launch down in
+# ~2 s, and wait for it.
+#
+# SIGTERM, not SIGINT: a script started in the background (&) by another
+# script has SIGINT IGNORED, and bash cannot trap a signal that was ignored
+# on entry -- a SIGINT here would do nothing and the fallback would run.
 cleanup() {
-  save_everything
-  echo "[auto] Stopping everything..."
-  "$PROJECT_DIR/scripts/stop.sh" || true
-  if [ -n "$MAP_PGID" ] && kill -0 "-$MAP_PGID" 2>/dev/null; then
-    kill -INT "-$MAP_PGID" 2>/dev/null || true
-    sleep 3
-    kill -9 "-$MAP_PGID" 2>/dev/null || true
+  if [ -n "$MAP_PID" ] && kill -0 "$MAP_PID" 2>/dev/null; then
+    kill -TERM "$MAP_PID" 2>/dev/null
+    for _ in $(seq 50); do kill -0 "$MAP_PID" 2>/dev/null || return 0; sleep 0.1; done
+    echo "[auto] start_mapping.sh did not finish; forcing stop." >&2
+    "$PROJECT_DIR/scripts/stop.sh" || true
   fi
 }
 trap 'echo; echo "[auto] Interrupted."; cleanup; exit 130' INT TERM
@@ -72,13 +59,14 @@ echo "[auto] Autonomous mapping -> maps/$MAP_NAME"
 echo "[auto] Exploration budget: ${TIME_BUDGET}s. Watch at http://<car-ip>:8080"
 
 # --- 1. bring the stack up ---------------------------------------------------
-setsid "$PROJECT_DIR/scripts/start_mapping.sh" \
+# setsid so the terminal's Ctrl+C reaches only THIS script; cleanup() then
+# stops start_mapping.sh (and with it the whole launch).
+setsid "$PROJECT_DIR/scripts/start_mapping.sh" "$MAP_NAME" \
   explore:=true \
   detect_objects:=true \
   time_budget_sec:="$TIME_BUDGET" \
   "${EXTRA_ARGS[@]}" &
 MAP_PID=$!
-MAP_PGID=$(ps -o pgid= -p "$MAP_PID" | tr -d ' ')
 
 # env.sh sources /opt/ros/humble/setup.bash, which references unset vars;
 # relax `set -u` just while sourcing it so this script does not exit early.
@@ -155,7 +143,7 @@ print(f\"visited={d.get('visited')} failed={d.get('failed')} elapsed={d.get('ela
     if [ "$done_flag" = yes ]; then
       echo "[auto] Exploration reported complete."
       # Let the final map update and the last detections settle before saving.
-      sleep 8
+      sleep 3
       break
     fi
   fi
@@ -163,7 +151,23 @@ print(f\"visited={d.get('visited')} failed={d.get('failed')} elapsed={d.get('ela
 done
 
 # --- 5. save and shut down ---------------------------------------------------
+# The final save is simply the next autosave: the console rewrites
+# maps/$MAP_NAME.* every 10 s, so waiting one cycle after the map settled
+# guarantees the saved files include the finished room. (A separate
+# map_saver run here would race the autosave writing the same files.)
+saved=false
+if kill -0 "$MAP_PID" 2>/dev/null; then
+  echo "[auto] Final save to maps/$MAP_NAME ..."
+  final_from=$(date +%s)
+  sleep 11
+  yaml="$PROJECT_DIR/maps/$MAP_NAME.yaml"
+  [ -f "$yaml" ] && [ "$(stat -c %Y "$yaml")" -ge "$final_from" ] && saved=true
+fi
 trap - INT TERM
 cleanup
-echo "[auto] Done. Navigate on it with:"
-echo "  scripts/start_navigate.sh map:=$PROJECT_DIR/maps/$MAP_NAME.yaml"
+if [ "$saved" = true ]; then
+  echo "[auto] Done. Navigate on it with:"
+  echo "  scripts/start_navigate.sh map:=$PROJECT_DIR/maps/$MAP_NAME.yaml"
+else
+  echo "[auto] Stopped. No map was saved."
+fi

@@ -60,7 +60,17 @@ TRAJECTORY_BUILDER_2D.max_range = 10.0
 TRAJECTORY_BUILDER_2D.missing_data_ray_length = 10.
 TRAJECTORY_BUILDER_2D.use_imu_data = true
 TRAJECTORY_BUILDER_2D.use_online_correlative_scan_matching = true
-TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(0.1)
+-- Was math.rad(0.1): a new scan node for every tenth of a degree of turn.
+-- During autonomous exploration (constant small heading corrections) that
+-- meant well over a thousand nodes within minutes, each one adding loop-
+-- closure candidates and pose-graph optimisation work. The CPU fell behind
+-- ("Dropped N earlier points"), and every extra constraint was another
+-- chance of a wrong match -- which is what shifted the map mid-run, smeared
+-- wall edges, and drew "free" rays through obstacles. 1 deg / 10 cm is
+-- Cartographer's own recommended range (defaults 1 deg / 20 cm; 10 cm here
+-- because the room is small).
+TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(1.0)
+TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.10
 
 -- In a bare room centre, parallel/distant walls do not constrain every pose
 -- direction. Require stronger scan evidence before moving away from the

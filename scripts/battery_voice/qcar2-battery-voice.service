@@ -1,0 +1,11 @@
+[Unit]
+Description=QCar2 spoken low-battery warnings (below 10.8 V, every 0.1 V)
+After=multi-user.target sound.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/qcar2/qcar2_battery_voice.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

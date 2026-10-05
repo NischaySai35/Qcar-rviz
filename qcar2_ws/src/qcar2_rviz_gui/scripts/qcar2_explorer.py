@@ -120,12 +120,25 @@ class Explorer(Node):
         # line itself: a goal on the unknown edge turns into a wall the moment
         # the LiDAR reveals one there, and Nav2 aborts. The LiDAR still sees
         # 12 m into the unknown area from the pulled-back point.
-        self.declare_parameter('wall_clearance', 0.30)
+        self.declare_parameter('wall_clearance', 0.40)
         self.declare_parameter('unknown_backoff', 0.35)
         self.declare_parameter('approach_radius', 1.5)
         # Failed frontiers are retried after this long: the map keeps growing,
         # and a frontier that was unreachable a minute ago often is not now.
         self.declare_parameter('blacklist_ttl_sec', 120.0)
+        # TWO PHASES. Exploring every frontier equally sent the car poking
+        # into every gap under a chair and behind a cabinet. Instead:
+        #   main   -- only big openings (>= main_min_cells of frontier, i.e.
+        #             1 m at 5 cm cells) whose goal has main_clearance of room:
+        #             the open body of the room, driven comfortably.
+        #   detail -- afterwards, smaller openings (>= detail_min_cells) that
+        #             can be reached with wall_clearance (the 40 cm rule), for
+        #             at most detail_budget_sec. Anything smaller is never
+        #             chased: it is under or behind furniture.
+        self.declare_parameter('main_min_cells', 20)
+        self.declare_parameter('main_clearance', 0.55)
+        self.declare_parameter('detail_min_cells', 10)
+        self.declare_parameter('detail_budget_sec', 180.0)
 
         g = lambda n: self.get_parameter(n).value
         self.map_frame = g('map_frame')
@@ -145,6 +158,13 @@ class Explorer(Node):
         self.unknown_backoff = float(g('unknown_backoff'))
         self.approach_radius = float(g('approach_radius'))
         self.blacklist_ttl = float(g('blacklist_ttl_sec'))
+        self.phases = {
+            'main': (int(g('main_min_cells')), float(g('main_clearance'))),
+            'detail': (int(g('detail_min_cells')), self.wall_clearance),
+        }
+        self.detail_budget = float(g('detail_budget_sec'))
+        self.phase = 'main'
+        self.detail_started = None
 
         self.map = None
         self.enabled = True
@@ -296,10 +316,12 @@ class Explorer(Node):
                 return
         self.blacklist.append((x, y, 1, now))
 
-    def rank(self, frontiers, car):
+    def rank(self, frontiers, car, min_cells=0):
         """All usable frontiers, best first: big and close beats small and far."""
         scored = []
         for fx, fy, size in frontiers:
+            if size < min_cells:
+                continue
             d = math.hypot(fx - car[0], fy - car[1])
             # Too close to steer to (Ackermann), or implausibly far.
             if d < self.min_goal_distance or d > self.max_goal_distance:
@@ -315,27 +337,28 @@ class Explorer(Node):
         ranked = self.rank(frontiers, car)
         return ranked[0] if ranked else None
 
-    def clearance_mask(self):
-        """Cells that are safe to PARK on: observed free, clear of walls, and
-        pulled back from the unknown edge. Cached per map update, because the
-        distance transforms are the expensive part of a planning tick."""
+    def clearance_mask(self, clearance=None):
+        """Cells that are safe to PARK on: observed free, at least `clearance`
+        from walls, and pulled back from the unknown edge. The distance
+        transforms (the expensive part of a planning tick) are cached per map
+        update; each clearance level is then just a threshold."""
+        clearance = self.wall_clearance if clearance is None else clearance
         grid = self.map
         stamp = (grid.header.stamp.sec, grid.header.stamp.nanosec,
                  grid.info.width, grid.info.height)
-        if self._clearance is not None and self._clearance[0] == stamp:
-            return self._clearance[1]
-        from scipy.ndimage import distance_transform_edt
-        h, w = grid.info.height, grid.info.width
-        res = grid.info.resolution
-        data = np.asarray(grid.data, dtype=np.int16).reshape(h, w)
-        free = (data >= 0) & (data <= FREE_MAX)
-        d_wall = distance_transform_edt(data < OCCUPIED_MIN) * res
-        d_unknown = distance_transform_edt(data != UNKNOWN) * res
-        ok = free & (d_wall >= self.wall_clearance) & (d_unknown >= self.unknown_backoff)
-        self._clearance = (stamp, ok)
-        return ok
+        if self._clearance is None or self._clearance[0] != stamp:
+            from scipy.ndimage import distance_transform_edt
+            h, w = grid.info.height, grid.info.width
+            res = grid.info.resolution
+            data = np.asarray(grid.data, dtype=np.int16).reshape(h, w)
+            free = (data >= 0) & (data <= FREE_MAX)
+            d_wall = distance_transform_edt(data < OCCUPIED_MIN) * res
+            d_unknown = distance_transform_edt(data != UNKNOWN) * res
+            self._clearance = (stamp, free & (d_unknown >= self.unknown_backoff), d_wall)
+        _stamp, base, d_wall = self._clearance
+        return base & (d_wall >= clearance)
 
-    def approach_goal(self, fx, fy):
+    def approach_goal(self, fx, fy, clearance=None):
         """Nearest safe parking cell to a frontier point, or None.
 
         The frontier point itself is a bad goal: it sits on the unknown edge
@@ -348,7 +371,7 @@ class Explorer(Node):
             return None
         info = grid.info
         res = info.resolution
-        ok = self.clearance_mask()
+        ok = self.clearance_mask(clearance)
         h, w = ok.shape
         c0 = int((fx - info.origin.position.x) / res)
         r0 = int((fy - info.origin.position.y) / res)
@@ -416,9 +439,13 @@ class Explorer(Node):
         # Best frontier that we can actually park near. One that has nowhere
         # safe to stop (e.g. a gap between two chair legs) gets a strike and we
         # fall through to the next, rather than sending Nav2 a doomed goal.
+        if self.phase == 'detail' and \
+                time.monotonic() - self.detail_started > self.detail_budget:
+            return self.finish('main area mapped; time for the smaller corners used up')
+        min_cells, clearance = self.phases[self.phase]
         target = None
-        for fx, fy, size, dist in self.rank(frontiers, car):
-            goal = self.approach_goal(fx, fy)
+        for fx, fy, size, dist in self.rank(frontiers, car, min_cells):
+            goal = self.approach_goal(fx, fy, clearance)
             if goal is None:
                 self.strike(fx, fy)
                 continue
@@ -429,6 +456,19 @@ class Explorer(Node):
                 continue
             target = (fx, fy, size, goal)
             break
+
+        if target is None and self.phase == 'main':
+            # The open body of the room is done. Now the smaller, still
+            # easy-to-reach openings, with a fresh blacklist (a spot that was
+            # too tight for the main phase's clearance may be fine now).
+            self.phase = 'detail'
+            self.detail_started = time.monotonic()
+            self.blacklist = []
+            self.get_logger().info('Main area mapped; now the smaller openings that are '
+                                   'easy to reach.')
+            if self.announce:
+                self.say('Main area mapped. Checking the remaining corners.')
+            return self.idle('searching', 'main area done; looking at smaller openings')
 
         if target is None:
             if self.blacklist and not self.retried:
@@ -568,6 +608,7 @@ class Explorer(Node):
             'blacklisted': len(self.blacklist),
             'state': self.state,
             'reason': self.reason,
+            'phase': self.phase,
             'frontiers': self.frontier_count,
             'elapsed': round(time.monotonic() - self.started_at, 1),
             'budget': self.time_budget,

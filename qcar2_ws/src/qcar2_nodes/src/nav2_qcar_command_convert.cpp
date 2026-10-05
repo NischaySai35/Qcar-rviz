@@ -15,6 +15,8 @@
 #include <chrono>
 #include <thread>
 
+#include "action_msgs/msg/goal_status.hpp"
+#include "action_msgs/msg/goal_status_array.hpp"
 #include "quanser/quanser_hid.h"
 #include "qcar2_interfaces/msg/boolean_leds.hpp"
 #include "qcar2_interfaces/msg/motor_commands.hpp"
@@ -112,6 +114,24 @@ class Nav2QCarConverter : public rclcpp::Node
         "/qcar2/manual_drive_active", rclcpp::QoS(1),
         [this](const std_msgs::msg::Bool &msg) { manual_active_ = msg.data; });
 
+    // Is behavior_server's BackUp recovery running right now?  Read from the
+    // action's own status topic rather than inferred from the Twist -- see
+    // the STEERED BACK-UP block in nav2_command_callback().  Same QoS as rcl's
+    // action status publisher (reliable + transient_local), so a goal that
+    // was already executing when this node subscribed is still seen.
+    backup_status_subscriber_ = this->create_subscription<action_msgs::msg::GoalStatusArray>(
+        "/backup/_action/status", rclcpp::QoS(10).reliable().transient_local(),
+        [this](const action_msgs::msg::GoalStatusArray &msg) {
+            bool active = false;
+            for (const auto &goal : msg.status_list) {
+                if (goal.status == action_msgs::msg::GoalStatus::STATUS_ACCEPTED ||
+                    goal.status == action_msgs::msg::GoalStatus::STATUS_EXECUTING) {
+                    active = true;
+                }
+            }
+            backup_active_ = active;
+        });
+
     //publishing timer for converted command
     // Match the QCar speed-control loop closely enough for smooth motion
     // without flooding a depth-one motor command subscription at 1 kHz.
@@ -173,6 +193,38 @@ class Nav2QCarConverter : public rclcpp::Node
                 nav2_steering = 0.0;
             }
 
+            // STEERED BACK-UP.  Nav2's BackUp recovery always reverses dead
+            // straight (linear.x < 0 with angular.z exactly 0 -- the
+            // controller never produces an exact zero), which is the "it
+            // straightens the wheels when reversing" complaint: a straight
+            // reverse only undoes the last approach, and the car drives
+            // straight back into the same spot.  A driver stuck nose-first
+            // reverses on OPPOSITE lock -- the middle of a three-point turn --
+            // so the car keeps rotating toward where it was trying to go.
+            // Same here, only if it was genuinely turning forward within the
+            // last kBackupSteerMemory, and still clamped to the live limit.
+            //
+            // BackUp is identified by its action status, NOT by
+            // "angular.z == 0.0".  The controller never produces an exact
+            // zero, but velocity_smoother does: its angular deadband (0.01
+            // rad/s) snaps every small wz to exactly 0.0.  So whenever MPPI
+            // itself chose a near-straight reverse (a Reeds-Shepp reverse
+            // segment, or backing away from someone who stepped in close),
+            // the old test mistook it for BackUp and flicked the wheels to
+            // full opposite lock mid-manoeuvre.
+            const rclcpp::Time now = this->now();
+            if (nav2_speed > kMinSpeedForSteering && std::abs(nav2_steering) > 0.15) {
+                last_forward_steering_ = nav2_steering;
+                last_forward_steering_time_ = now;
+            }
+            if (nav2_speed < -kMinSpeedForSteering && backup_active_ &&
+                last_forward_steering_time_.nanoseconds() != 0 &&
+                (now - last_forward_steering_time_) < kBackupSteerMemory)
+            {
+                double limit = max_steering_rad_.load();
+                nav2_steering = std::clamp(-std::copysign(limit, last_forward_steering_),
+                                           -limit, limit);
+            }
         }
 
 
@@ -446,10 +498,20 @@ class Nav2QCarConverter : public rclcpp::Node
         std::atomic<double> max_steering_rad_{kSteeringStopRad};
         rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
 
-        // Nav2's controller runs at 20 Hz (50 ms).  Three missed cycles is a
-        // real dropout, not jitter.
+        // Nav2's controller runs at 20 Hz (50 ms).  Was 150 ms (three cycles),
+        // but on this ARM board one MPPI optimisation regularly runs long
+        // (899 "missed its desired rate" warnings in one auto-mapping run),
+        // and every such hiccup zeroed the motor -- which, before the resume
+        // fix in qcar2_hardware.cpp, also threw away the throttle the speed
+        // loop had built up, so the car never got moving.  300 ms still stops
+        // a car whose commands have genuinely ceased within ~10 cm at cruise.
         rclcpp::Time last_command_time_{0, 0, RCL_ROS_TIME};
-        const rclcpp::Duration kCommandTimeout{std::chrono::milliseconds(150)};
+        const rclcpp::Duration kCommandTimeout{std::chrono::milliseconds(300)};
+        // Steered back-up -- see nav2_command_callback().
+        double last_forward_steering_ = 0.0;
+        rclcpp::Time last_forward_steering_time_{0, 0, RCL_ROS_TIME};
+        const rclcpp::Duration kBackupSteerMemory{std::chrono::seconds(3)};
+        bool backup_active_ = false;
 
         rclcpp::TimerBase::SharedPtr timer_;
         rclcpp::TimerBase::SharedPtr timer2_;
@@ -463,6 +525,7 @@ class Nav2QCarConverter : public rclcpp::Node
         rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscriber_;
         rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr manual_drive_subscriber_;
         rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr manual_active_subscriber_;
+        rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr backup_status_subscriber_;
         bool estop_engaged_ = false;
         
 };

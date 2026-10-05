@@ -40,9 +40,12 @@ def main():
     node = QCar2ModelJointState()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass            # Ctrl+C is a normal stop, not a crash to report
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():  # ROS's own signal handler may already have shut down
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

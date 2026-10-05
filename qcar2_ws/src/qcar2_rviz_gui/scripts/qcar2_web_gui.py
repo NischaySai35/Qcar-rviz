@@ -116,6 +116,43 @@ def sample_grid(grid, x, y):
     return None if v == 255 else v
 
 
+def write_map_files(grid, base):
+    """Save a grid_payload()'d /map as <base>.pgm + <base>.yaml, exactly as
+    nav2's map_saver_cli does in its default trinary mode (same thresholds,
+    same pixel values, same YAML keys), so navigation loads it unchanged.
+
+    Done here, from the copy this node already holds, because it is instant.
+    Running map_saver_cli means starting a fresh ROS node and waiting for DDS
+    discovery -- several seconds on this board, which is what made Ctrl+C
+    slow when the map was saved on the way out.
+    """
+    w, h = grid['w'], grid['h']
+    cells = np.frombuffer(grid['data'], dtype=np.uint8).reshape(h, w).astype(np.int16)
+    cells[cells == 255] = -1                           # unknown
+    img = np.full((h, w), 205, dtype=np.uint8)         # map_saver: unknown
+    img[(cells >= 0) & (cells <= 25)] = 254            # <= free_thresh 0.25
+    img[cells >= 65] = 0                               # >= occupied_thresh 0.65
+    img = img[::-1]                                    # grid row 0 is the BOTTOM row
+    os.makedirs(os.path.dirname(base) or '.', exist_ok=True)
+    # Write to a temp file and rename over the old one: autosave rewrites
+    # these every few seconds, and a rename is atomic, so a Ctrl+C or a
+    # reader mid-save sees either the old complete map or the new one --
+    # never a half-written file.
+    with open(base + '.pgm.tmp', 'wb') as fh:
+        fh.write(f'P5\n# CREATOR: qcar2_web_gui {grid["res"]:.3f} m/pix\n{w} {h}\n255\n'.encode())
+        fh.write(img.tobytes())
+    os.replace(base + '.pgm.tmp', base + '.pgm')
+    with open(base + '.yaml.tmp', 'w') as fh:
+        fh.write(f'image: {os.path.basename(base)}.pgm\n'
+                 f'mode: trinary\n'
+                 f'resolution: {grid["res"]:.3f}\n'
+                 f'origin: [{grid["ox"]:.3f}, {grid["oy"]:.3f}, 0]\n'
+                 f'negate: 0\n'
+                 f'occupied_thresh: 0.65\n'
+                 f'free_thresh: 0.25\n')
+    os.replace(base + '.yaml.tmp', base + '.yaml')
+
+
 def pack_grid(tag, grid):
     """Binary wire format for a grid_payload(): 1-byte tag + w/h/res/ox/oy/yaw
     header, then the raw cost bytes with no base64/JSON wrapping at all.
@@ -160,6 +197,7 @@ class State:
         # strings by their owning nodes and forwarded to the browser verbatim.
         self.objects = []
         self.answers = []        # recent question/answer pairs for the console
+        self.spoken = []         # recent sentences the speaker said, newest first
         self.detections = {}     # latest live boxes per camera (see on_detections)
         self.object_stats = {}
         self.voice = {'enabled': False, 'source': 'car', 'status': 'off',
@@ -175,6 +213,29 @@ class WebGuiNode(Node):
         self.mode = self.declare_parameter('mode', 'navigation').value
         self.port = int(self.declare_parameter('port', 8080).value)
         self.open_browser = bool(self.declare_parameter('open_browser', True).value)
+        # True when the main launch runs all four cameras (see side_cameras_external).
+        self.cameras_owned = bool(self.declare_parameter('cameras_owned', False).value)
+        # Image shown as the console's front camera. Mapping keeps the CSI
+        # bumper camera; navigation passes the RealSense depth view
+        # (/front/camera/depth_view, see qcar2_depth_view.py).
+        self.front_topic = self.declare_parameter(
+            'front_camera_topic', '/front/camera/csi_image').value
+        # AUTOSAVE: rewrite maps/<autosave_name>.yaml/.pgm (+ _objects.json via
+        # the object mapper) every autosave_period_sec, overwriting the same
+        # files. The mapping scripts pass the name, so Ctrl+C -- which saves
+        # nothing and just stops -- loses at most the last few seconds.
+        # Empty name = no autosave.
+        self.autosave_name = ''.join(
+            ch for ch in str(self.declare_parameter('autosave_name', '').value)
+            if ch.isalnum() or ch in '-_')
+        autosave_period = float(self.declare_parameter('autosave_period_sec', 10.0).value)
+        self._autosave_logged = False
+        if self.autosave_name:
+            self.create_timer(autosave_period, self.autosave)
+        # True when Nav2 drives the motors through nav2_qcar2_converter: always
+        # in navigation mode, and in mapping mode when auto-explore is on.
+        self.nav2_drives = self.mode != 'mapping' or bool(
+            self.declare_parameter('nav2_drives', False).value)
 
         self.tf_buffer = Buffer()
         TransformListener(self.tf_buffer, self)
@@ -201,7 +262,7 @@ class WebGuiNode(Node):
         # cameras remain on their 5 Hz preview topics because all four raw
         # 80 Hz streams would be needless CPU load.
         for name in CAMERAS:
-            topic = f'/{name}/camera/csi_image' if name == 'front' else f'/{name}/camera/preview'
+            topic = self.front_topic if name == 'front' else f'/{name}/camera/preview'
             self.create_subscription(
                 Image, topic,
                 lambda msg, name=name: self.on_image(name, msg), CAMERA_QOS)
@@ -209,6 +270,7 @@ class WebGuiNode(Node):
         # ---- semantic map, voice and exploration status in
         self.create_subscription(String, '/qcar2/objects', self.on_objects, LATCHED)
         self.create_subscription(String, '/qcar2/answer', self.on_answer, 10)
+        self.create_subscription(String, '/qcar2/spoken', self.on_spoken, 10)
         self.create_subscription(String, '/qcar2/detections', self.on_detections, 10)
         self.create_subscription(String, '/qcar2/voice_transcript', self.on_voice_transcript, 10)
         self.create_subscription(String, '/qcar2/explore_status', self.on_explore_status, LATCHED)
@@ -271,11 +333,20 @@ class WebGuiNode(Node):
         self.publish_mic()
         self.publish_estop()
 
-        # ---- manual drive (mapping only).  The hardware latches the last
-        # motor command, so zeros are published continuously whenever nothing
-        # is held, and a hold without a heartbeat for 0.4 s is dropped.
+        # ---- manual drive (plain mapping only).  The hardware latches the
+        # last motor command, so zeros are published continuously whenever
+        # nothing is held, and a hold without a heartbeat for 0.4 s is dropped.
+        #
+        # NOT when Nav2 drives (auto-explore). Those idle zeros went to the
+        # same /qcar2_motor_speed_cmd the converter was writing Nav2's speed
+        # to: 20 zeros a second interleaved with 50 "go"s, and every zero
+        # reset qcar2_hardware.cpp's throttle integrator, so it never built
+        # enough throttle to break static friction. That is why auto mapping
+        # "planned a path but never moved" -- every goal ended in "Failed to
+        # make progress" after exactly 5 s. The converter is the single
+        # writer then, and the pad uses its manual-override input instead.
         self.drive = {'speed': 0.0, 'steering': 0.0, 'held': False, 'last': 0.0}
-        if self.mode == 'mapping':
+        if not self.nav2_drives:
             self.create_timer(0.05, self.drive_tick)
 
         self.camera_process = None
@@ -636,6 +707,14 @@ class WebGuiNode(Node):
                                     'a': data.get('answer', '')}]
                                   + self.state.answers)[:6]
 
+    def on_spoken(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        with self.state.lock:
+            self.state.spoken = ([data] + self.state.spoken)[:10]
+
     def on_voice_transcript(self, msg):
         try:
             data = json.loads(msg.data)
@@ -694,10 +773,10 @@ class WebGuiNode(Node):
             return
         speed, steering = float(speed), float(steering)
         held = bool(speed or steering)
-        if self.mode == 'mapping':
+        if not self.nav2_drives:
             self.drive.update(speed=speed, steering=steering, held=held, last=time.monotonic())
         else:
-            # Navigation mode: highest-priority manual override.  Published
+            # Nav2 is driving: highest-priority manual override.  Published
             # straight through to nav2_qcar2_converter, which substitutes
             # this for whatever Nav2 is asking for as long as 'active' stays
             # true -- Nav2's goal is never cancelled, so releasing the
@@ -731,6 +810,12 @@ class WebGuiNode(Node):
         driver cannot open the same camera twice -- the duplicates fail and
         respawn in a loop behind a view that looks fine.
         """
+        # The launch file says so outright when it owns the cameras. Counting
+        # publishers is only the fallback: a camera mid-restart counts as 0,
+        # and that is exactly how duplicates got started and the two sets of
+        # camera nodes ended up fighting over the devices in a restart loop.
+        if self.cameras_owned:
+            return True
         own = self.camera_process is not None and self.camera_process.poll() is None
         return (not own) and self.count_publishers('/rear/camera/csi_image') > 0
 
@@ -759,12 +844,38 @@ class WebGuiNode(Node):
     def cameras_360_running(self):
         return self.camera_process is not None and self.camera_process.poll() is None
 
-    def save_map(self, name):
+    def autosave(self):
+        with self.state.lock:
+            if self.state.map is None:
+                return                          # nothing mapped yet
+        ok, detail = self.save_map(self.autosave_name, quiet=True)
+        if not ok:
+            self.get_logger().warn(f'autosave failed: {detail}')
+        elif not self._autosave_logged:
+            # Once, not every 10 s -- the terminal should stay readable.
+            self._autosave_logged = True
+            self.get_logger().info(
+                f'Autosaving to maps/{self.autosave_name}.yaml (+ objects) every few seconds.')
+
+    def save_map(self, name, quiet=False):
+        """Map (.pgm/.yaml) from this node's own copy of /map, plus a request
+        to the object mapper for <name>_objects.json. Instant -- see
+        write_map_files(). Used by the Save Map button and by autosave."""
         name = ''.join(ch for ch in name if ch.isalnum() or ch in '-_') or 'qcar_map'
-        script = os.path.join(PROJECT_DIR, 'scripts', 'save_map.sh')
-        result = subprocess.run([script, name], capture_output=True, text=True, timeout=30)
-        ok = result.returncode == 0
-        return ok, (f'Saved maps/{name}.yaml' if ok else result.stderr.strip()[-300:] or 'save failed')
+        with self.state.lock:
+            grid = self.state.map
+        if grid is None:
+            return False, 'No map received yet -- nothing to save.'
+        try:
+            write_map_files(grid, os.path.join(PROJECT_DIR, 'maps', name))
+        except OSError as exc:
+            return False, f'Could not write maps/{name}: {exc}'
+        msg = String()
+        msg.data = name
+        self.save_objects_pub.publish(msg)
+        if not quiet:
+            self.get_logger().info(f'Saved map: maps/{name}.yaml + .pgm')
+        return True, f'Saved maps/{name}.yaml'
 
     def stop_all(self):
         self.set_estop(True)
@@ -834,7 +945,7 @@ class WebServer:
                     'warnings': s.warnings,
                     'mic': {'on': n.mic_on, 'source': n.mic_source},
                     'objects': s.objects, 'object_stats': s.object_stats,
-                    'answers': s.answers,
+                    'answers': s.answers, 'spoken': s.spoken,
                     # Live boxes, dropped entirely once stale so a stopped
                     # detector cannot leave frozen boxes drawn on live video.
                     'detections': (s.detections if time.monotonic() -
@@ -1047,9 +1158,10 @@ class WebServer:
             except OSError:
                 pass
         # shutdown_timeout: how long to wait for open WebSocket/MJPEG streams
-        # to drain on Ctrl+C.  The default is 60 s, which read as "hung".
+        # to drain on Ctrl+C.  The default is 60 s, which read as "hung";
+        # 2 s still ate most of the 3 s stop.sh allows, so 0.5 s.
         web.run_app(self.app, host='0.0.0.0', port=port, print=None,
-                    handle_signals=True, shutdown_timeout=2.0)
+                    handle_signals=True, shutdown_timeout=0.5)
 
 
 def main():

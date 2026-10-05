@@ -24,6 +24,7 @@ install(PROGRAMS
   scripts/qcar2_voice_command.py
   scripts/qcar2_explorer.py
   scripts/qcar2_assistant.py
+  scripts/qcar2_depth_view.py
   DESTINATION lib/${PROJECT_NAME})
 
 # Browser console served by qcar2_web_gui.py (symlink-installed, so edits to

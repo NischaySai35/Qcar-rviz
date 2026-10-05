@@ -13,7 +13,7 @@
   the car would reverse indefinitely: the converter latched the last command
   forever, so when BackUp finished and stopped publishing, the reverse command
   stayed applied.  That root cause is fixed — nav2_qcar_command_convert.cpp
-  now zeroes speed and steering if /cmd_vel goes quiet for 150 ms — and the
+  now zeroes speed and steering if /cmd_vel goes quiet for 300 ms — and the
   car is deliberately reversing-capable now, so backing up is exactly the
   right way out of the "wedged against a wall and cannot move" state.
 
@@ -45,7 +45,7 @@
   NavigateRecovery's number_of_retries was 6.  nav2_behavior_tree's
   RecoveryNode (recovery_node.hpp) returns FAILURE outright once that count is
   exhausted: bt_navigator then ABORTS the whole goal, every server stops
-  publishing, and nav2_qcar_command_convert.cpp's 150 ms watchdog zeroes the
+  publishing, and nav2_qcar_command_convert.cpp's 300 ms watchdog zeroes the
   motors.  The car does not idle at that point, it is DONE: nothing will move
   it again until a fresh goal arrives.  That silent abort, not a hang, is what
   looked like "it stopped for no reason", and 6 cycles at ~1 Hz was only a few

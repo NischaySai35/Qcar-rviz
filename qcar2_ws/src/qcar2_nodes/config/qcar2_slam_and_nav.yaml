@@ -172,7 +172,14 @@ controller_server:
       # real stall, and the answer to it is to back up and retry with room --
       # which is now the first thing tried, see the RoundRobin in
       # navigate_to_pose_ackermann.xml.
-      movement_time_allowance: 5.0
+      #
+      # 5 -> 3 s (2026-09-25).  Part of those 5 s used to be the motor simply
+      # getting going: qcar2_hardware.cpp climbed from zero throttle through
+      # the ~0.03 deadband before the wheels turned at all.  It now starts at
+      # the deadband edge, so 3 s without covering 0.1 m is a genuine "stuck"
+      # -- and backing up 2 s sooner is what makes a bad start (e.g. nose to
+      # an obstacle) resolve quickly instead of the car sitting there.
+      movement_time_allowance: 3.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "nav2_controller::SimpleGoalChecker"
@@ -299,7 +306,11 @@ controller_server:
         # Brought back to 5.0 alongside inflation_radius above: at 6.0 it was
         # also fighting tight, close-to-a-wall goal approaches, adding to the
         # hesitant near-goal steering.  Still above the original 4.0.
-        repulsion_weight: 5.0
+        # 5.0 -> 3.0 (2026-09-25): "drives like a baby crawling, too afraid to
+        # go near objects". With the wider 0.45 m local inflation the push is
+        # felt early anyway; at 5 it made every rollout near furniture look
+        # worse than creeping, so the car hesitated where there was room.
+        repulsion_weight: 3.0
         critical_weight: 80.0
         # Was true, and this was the main reason the obstacle boundary lagged.
         # consider_footprint rasterises the full robot polygon against the
@@ -314,6 +325,11 @@ controller_server:
         # traded away.
         consider_footprint: false
         collision_cost: 10000.0
+        # Spelled out (this is the 1.1.x default): a rollout point closer
+        # than this to an obstacle's inscribed edge is charged at
+        # critical_weight instead of the gentle repulsion -- the "a person
+        # walked straight at the car, no choice but to react hard" case.
+        collision_margin_distance: 0.10
         near_goal_distance: 0.5
       ConstraintCritic:
         enabled: true
@@ -344,14 +360,22 @@ controller_server:
         cost_weight: 3.0
         threshold_to_consider: 0.5
       PreferForwardCritic:
-        # Disabled now that the car is deliberately reversing-capable.  This
-        # critic penalises every reverse trajectory, so with Reeds-Shepp it
-        # fought the planner's own reverse segments and the car would stall
-        # rather than back up.  Direction preference is expressed in the
-        # planner instead, via reverse_penalty.
-        enabled: false
+        # Was disabled: at weight 5.0 it penalised every reverse trajectory
+        # hard enough to fight the planner's own reverse segments, and the
+        # car would stall rather than back up.
+        #
+        # Re-enabled at 2.0 (2026-10-05) as a TIE-BREAKER only: "drive
+        # forward by default, reverse only when there is no good forward
+        # option".  Cost is metres reversed over the rollout x weight, so a
+        # full 2.8 s reverse at vx_min costs ~0.56 x 2 = ~1.1 -- small next
+        # to PathAlignCritic (10) / PathFollowCritic (8) / ObstaclesCritic.
+        # When forward and reverse score about the same, forward wins; when
+        # the path or a close obstacle genuinely needs reversing, the other
+        # critics outvote it and the car still backs up.  If "stalls instead
+        # of backing up" returns, lower this before disabling it.
+        enabled: true
         cost_power: 1
-        cost_weight: 5.0
+        cost_weight: 2.0
         threshold_to_consider: 0.5
       PathAlignCritic:
         enabled: true
@@ -364,7 +388,21 @@ controller_server:
         # steering hard toward the goal.  16 still holds the line on normal
         # open-path driving (this critic's original job) while leaving
         # GoalCritic's now-stronger pull room to win a close-in maneuver.
-        cost_weight: 16.0
+        #
+        # 16 -> 10: the "slows right down in turns" fix, controller half.
+        # This critic compares each rollout point with the path point at the
+        # SAME distance along the path.  In a curve the car can never sit
+        # exactly on the line (it lags into the turn), and that lag grows the
+        # further ahead a rollout reaches -- so a fast rollout collects more
+        # misalignment than a slow one that barely leaves the car's current
+        # spot.  At 16 that made "crawl through the bend" the cheapest
+        # answer.  At 10 the car may run a few centimetres wide of the line
+        # through a turn and rejoin it after, which is what a real car does
+        # and exactly what was asked for ("turn and then continue the
+        # path").  It cannot cut into obstacles doing so: the planner's line
+        # is now centred in the gap (global inflation 0.9 m) and
+        # ObstaclesCritic still scores every rollout against the live scan.
+        cost_weight: 10.0
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 4
         threshold_to_consider: 0.5
@@ -380,7 +418,13 @@ controller_server:
       PathFollowCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 5.0
+        # 5 -> 8.  This is the only critic that rewards PROGRESS: it scores
+        # how close each rollout's end gets to a point a little further along
+        # the path, so faster rollouts that get further score better.  With
+        # PathAlignCritic trimmed above, raising this keeps the balance
+        # tipped toward "keep moving through the bend" instead of "slow down
+        # to stay precisely on the line".
+        cost_weight: 8.0
         offset_from_furthest: 5
         threshold_to_consider: 1.4
       PathAngleCritic:
@@ -445,7 +489,12 @@ local_costmap:
         # passing well outside the robot's own footprint already pick up
         # some cost and MPPI starts curving away earlier, not just when the
         # collision-radius boundary is reached.
-        cost_scaling_factor: 1.5
+        #
+        # Now 3.0 with the 0.55 m radius below -- the same slope as the
+        # global costmap, so the controller's idea of "close" matches the
+        # planner's.  (With the old 0.25 m radius the slope hardly mattered:
+        # the band ended before it could decay.)
+        cost_scaling_factor: 3.0
         # THIS is the halo drawn around the live LiDAR returns (the cyan
         # points) near the car -- the global costmap's inflation only shows
         # around mapped walls.  0.22 -> 0.60 -> 0.50 -> 0.30 -> 0.25 m, the
@@ -466,7 +515,26 @@ local_costmap:
         # together.  The visible thickness cannot be thinned separately from
         # the margin via cost_scaling_factor: at any usable factor the cost
         # stays >= 1 out to the full radius, so the band always draws to it.
-        inflation_radius: 0.25
+        #
+        # NOW 0.55 m.  The thin 0.25 m band was the controller half of "goes
+        # too near obstacles": ObstaclesCritic's repulsion is
+        # (inflation_radius - distance), so it is ZERO outside this radius,
+        # and at 0.25 m -- the car's own corner radius -- MPPI felt nothing
+        # until a corner was nearly touching.  A person stepping in between
+        # replans (2 Hz) got the same last-moment swerve.  At 0.55 m the
+        # push starts ~30 cm before contact, so the car eases away early.
+        # This is still well inside the global costmap's 0.9 m, so the
+        # controller never fights the planner's centred path.  The visible
+        # band stays thin: web/index.html draws the low-cost outer part of
+        # this halo faintly.  It also clears the "inflation is not set
+        # sufficiently" warning, since 0.55 > 0.25 m circumscribed.
+        #
+        # 0.55 -> 0.45 (2026-09-25), on the operator's rule: the car may go
+        # as close as 40 cm to an obstacle, closer risks a crash. The push
+        # now starts at 0.45 m from the LiDAR, so there is no penalty for
+        # using space the operator has said is fine, and the planner's 0.9 m
+        # global gradient still keeps paths down the middle when there is room.
+        inflation_radius: 0.45
       # A 2D LiDAR cannot fill a 3D voxel grid, so the VoxelLayer that used to
       # be here could mark a cell but never gather enough evidence to clear it
       # again -- that is what left a trail of "ghost" footprints behind moving
@@ -537,25 +605,62 @@ global_costmap:
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
+        # WAS the default 100, and in auto-mapping that made every MAPPED
+        # wall invisible to the planner.  StaticLayer only treats a map cell
+        # as an obstacle when its value >= lethal_cost_threshold; anything
+        # below is FREE.  A saved map is fine (map_server writes walls as
+        # exactly 100), but auto-mapping feeds Cartographer's LIVE /map, and
+        # Cartographer clamps every cell at kMaxProbability = 0.9 -- its walls
+        # top out at 90 and never reach 100.  So the planner only saw walls
+        # the LiDAR happened to be hitting at that moment (the obstacle layer)
+        # and happily drew the green path through walls behind or beside the
+        # car, which the controller then had to fight its way out of.
+        # 65 = map_saver's occupied_thresh (0.65), i.e. exactly the cells that
+        # would be saved as walls; no effect on saved maps (already 0/100).
+        lethal_cost_threshold: 65
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 1.5
-        # This is the halo actually visible across the WHOLE map in the web
-        # console -- the local costmap's inflation (see local_costmap above)
-        # only covers a 6x6 m rolling window around the robot, so it can't
-        # be what shows up thick around walls far from the car.  0.35 -> 0.28
-        # -> 0.15 m, deliberately BELOW the footprint's circumscribed radius
-        # (sqrt(0.22^2+0.12^2) = 0.2506 m).  That floor genuinely matters for
-        # the LOCAL costmap, because MPPI's ObstaclesCritic reads that one
-        # with consider_footprint:false and so leans on inflation to stand in
-        # for the robot's extent.  It does NOT matter here: this costmap only
-        # feeds SmacPlannerHybrid's global path and the console's rendering.
-        # Real clearance around obstacles is still enforced by the local
-        # costmap's 0.50 m inflation plus ObstaclesCritic, which is what the
-        # car actually drives on.  The only practical effect of going this
-        # thin is that the GLOBAL path may be drawn closer to walls; the
-        # local planner still refuses to follow it in that closely.
-        inflation_radius: 0.15
+        # WAS 0.15 m / 1.5 -- and that thin halo was the root cause of BOTH
+        # "it drives too close to obstacles and manoeuvres around them at
+        # the last moment" and "it slows right down in every turn".
+        #
+        # SmacPlannerHybrid only avoids what this costmap gives a cost to.
+        # With 0.15 m (below the car's own 0.25 m circumscribed radius) every
+        # cell more than 15 cm from an obstacle was free, so the cheapest
+        # path was the SHORTEST one: skim along walls, clip every inner
+        # corner, and pass a person with centimetres to spare.  MPPI then
+        # had to follow a line that brushed the obstacle, and any fast
+        # rollout along it swept through the obstacle's collision margin a
+        # second or two ahead, so the only low-cost option was to crawl --
+        # which is exactly the slow-down seen in turns, because the inner
+        # corner of a turn is where a shortest path touches the wall.
+        #
+        # Now the cost decays gently from the obstacle out to 0.9 m, so the
+        # planner sees a valley running down the MIDDLE of every gap: between
+        # two walls it drives the centre line, between a person and a wall it
+        # takes the middle of that gap, and it bends around a corner with
+        # room instead of clipping it.  It is still a trade against length,
+        # not a ban: planner_server's cost_penalty (2.0) turns cost into
+        # extra distance, so a short route through a normal doorway still
+        # beats a long way round, and the long way round only wins when the
+        # short one is a squeeze for most of its length.  Worked numbers
+        # (checked when this was tuned, 2026-09-25): hugging a wall at 0.4 m
+        # costs ~1.9x per metre, the middle of a wide gap ~1.1x, a doorway on
+        # a 6 m trip +7%.  If you change the 3.0 slope, change NEAR_COST in
+        # web/index.html's costColor() to match.  Passing at 0.4 m instead
+        # of 0.8 m therefore costs noticeably more than the few centimetres
+        # of extra length the wider line needs.
+        #
+        # 3.0 is the slope of that valley: cost = 252 * exp(-3.0 * (d - 0.12)).
+        # Much steeper and it is flat (free) half-way across a room, so the
+        # centring disappears; much gentler and every path looks equally
+        # expensive near walls and the planner starts preferring detours.
+        #
+        # The web console draws only the inner, costly part of this halo in
+        # full colour -- see costColor() in web/index.html -- so the map
+        # still shows a thin band around walls, as requested earlier.
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.90
       always_send_full_costmap: True
 
 map_saver:
@@ -624,7 +729,16 @@ planner_server:
       # comfortably above that at 0.55 m -- every curve the planner emits is
       # then one MPPI can actually track, with margin.
       minimum_turning_radius: 0.55
-      reverse_penalty: 2.0
+      # Multiplies the cost of every reverse motion primitive.  2.0 -> 3.0
+      # (2026-10-05): at 2.0 a goal behind the car was often planned as one
+      # long reverse drive, and reverse driving is the car's weak direction
+      # (slower, steering less precise).  At 3.0 a metre of reverse costs as
+      # much as three of forward, so the planner prefers the forward loop /
+      # U-turn whenever one fits, and reverse is kept for short manoeuvre
+      # segments (three-point turns, backing out of a tight spot) or when
+      # there is no forward route at all.  Not a ban: a reverse route is
+      # still returned if it is the only one.
+      reverse_penalty: 3.0
       change_penalty: 0.0
       non_straight_penalty: 1.2
       cost_penalty: 2.0

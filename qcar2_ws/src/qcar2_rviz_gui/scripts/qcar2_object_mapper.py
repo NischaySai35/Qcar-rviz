@@ -115,6 +115,21 @@ def ang_norm(a):
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def number_names(objects):
+    """Give same-label objects distinct spoken names: sofa, sofa 2, sofa 3.
+
+    Ordered by landmark id (creation order), so the numbers stay the same
+    every time a saved map is loaded. Adds a 'name' key; 'label' stays the
+    plain class, which is what counting and matching use. Same rule as
+    qcar2_object_nav.py's copy -- keep them identical.
+    """
+    seen = {}
+    for o in sorted(objects, key=lambda o: (o['label'], o.get('id', 0))):
+        n = seen[o['label']] = seen.get(o['label'], 0) + 1
+        o['name'] = o['label'] if n == 1 else f"{o['label']} {n}"
+    return objects
+
+
 def quat_to_matrix(x, y, z, w):
     """Rotation matrix from a quaternion (no tf_transformations dependency)."""
     n = math.sqrt(x * x + y * y + z * z + w * w)
@@ -275,6 +290,63 @@ class Landmark:
         }
 
 
+class ClipVerifier:
+    """A second, independent opinion on what is inside a detection box.
+
+    YOLO-World proposes boxes and a name; this crops each box and asks CLIP
+    (a vision-language model: it scores how well an image matches each text
+    prompt) which of the vocabulary labels -- or a bare wall/floor -- it
+    shows. The two models fail differently: the detector is judging a region
+    in the context of a whole wide-angle frame, CLIP only the object itself,
+    so a crop that is really a dark window or a cabinet front stops being
+    mapped as a "television" just because it is rectangular and dark.
+
+    Why CLIP and not a chat-style VLM (LLaVA, moondream...): those take
+    seconds per image on this GPU while it is also running the detector and
+    the car; CLIP scores a whole batch of crops in a few milliseconds, so it
+    can check EVERY sighting, from every angle, continuously.
+    """
+
+    def __init__(self, labels, background, device='cuda'):
+        import clip
+        import torch
+        self.torch = torch
+        self.device = device
+        self.model, self.preprocess = clip.load('ViT-B/32', device=device)
+        self.model.eval()
+        self.labels = list(labels) + list(background)
+        self.background = set(background)
+        prompts = [f'a photo of a {name}' for name in self.labels]
+        with torch.no_grad():
+            text = self.model.encode_text(clip.tokenize(prompts).to(device))
+            self.text = text / text.norm(dim=-1, keepdim=True)
+
+    def classify(self, crops):
+        """BGR uint8 crops -> [(label, probability), ...], one per crop."""
+        if not crops:
+            return []
+        from PIL import Image as PILImage
+        torch = self.torch
+        batch = torch.stack([
+            self.preprocess(PILImage.fromarray(np.ascontiguousarray(c[:, :, ::-1])))
+            for c in crops]).to(self.device)
+        with torch.no_grad():
+            feats = self.model.encode_image(batch)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            probs = (100.0 * feats @ self.text.T).softmax(dim=-1).float().cpu().numpy()
+        best = probs.argmax(axis=1)
+        return [(self.labels[i], float(probs[k, i])) for k, i in enumerate(best)]
+
+
+def crop_box(img, x1, y1, x2, y2, pad=0.08):
+    """The detection box plus a little context, clipped to the image."""
+    h, w = img.shape[:2]
+    px, py = (x2 - x1) * pad, (y2 - y1) * pad
+    a, b = max(0, int(x1 - px)), max(0, int(y1 - py))
+    c, d = min(w, int(x2 + px)), min(h, int(y2 + py))
+    return img[b:d, a:c] if c - a >= 8 and d - b >= 8 else None
+
+
 class ObjectMapper(Node):
 
     def __init__(self):
@@ -285,10 +357,22 @@ class ObjectMapper(Node):
         project_dir = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz')
 
         self.declare_parameter('vocabulary_file', default_vocab)
-        self.declare_parameter('model_path', os.path.join(project_dir, 'models', 'yolov8s-worldv2.pt'))
+        # YOLO-World v2 LARGE (was the small model). Measured 2026-09-25 on 150
+        # COCO indoor photos, prompted with this car's real vocabulary:
+        #   yolov8s-worldv2  precision 0.69  recall 0.55  28 ms/frame on the Orin
+        #   yolov8l-worldv2  precision 0.76  recall 0.64  50 ms/frame
+        #   yoloe-26s/m      precision 0.66  recall 0.64  (newer family: far
+        #                    better at people, but worse at TVs and sofas --
+        #                    the furniture this map is for -- and it needs an
+        #                    ultralytics upgrade; not worth it)
+        # 50 ms fits easily in the 167 ms per-frame budget of detect_rate_hz 6.
+        self.declare_parameter('model_path', os.path.join(project_dir, 'models', 'yolov8l-worldv2.pt'))
         self.declare_parameter('cameras', ['front', 'rear', 'left', 'right'])
         self.declare_parameter('detect_rate_hz', 6.0)
-        self.declare_parameter('confidence', 0.25)
+        # 0.25 -> 0.35 with the move to the Large model (far fewer confident
+        # false positives to lose): weak guesses were what filled the map
+        # with a row of "televisions" along one wall.
+        self.declare_parameter('confidence', 0.35)
         self.declare_parameter('imgsz', 640)
         self.declare_parameter('half', False)
         # Horizontal field of view of the CSI lens, degrees. Quanser do not
@@ -305,14 +389,22 @@ class ObjectMapper(Node):
         self.declare_parameter('min_range', 0.25)
         self.declare_parameter('cluster_gap', 0.35)
         self.declare_parameter('min_cluster_points', 2)
-        self.declare_parameter('assoc_radius', 0.60)
-        self.declare_parameter('min_hits', 3)
+        # 0.60 -> 0.85 m. The LiDAR hits a DIFFERENT part of a big object
+        # (a TV, a sofa) from each viewpoint, so one object's sightings spread
+        # well over half a metre and split into several landmarks -- the
+        # "many TVs" on the map. Per-class overrides widen it further.
+        self.declare_parameter('assoc_radius', 0.85)
+        # 3 -> 5: three glimpses while creeping past something was enough to
+        # make a false detection permanent.
+        self.declare_parameter('min_hits', 5)
         # --- self-correction -------------------------------------------------
         # How close a detection of a DIFFERENT class must be to an existing
         # landmark before it is treated as "the same object, named better"
         # rather than a new object. Tighter than assoc_radius on purpose: a
         # desk and the chair under it must stay two landmarks.
-        self.declare_parameter('revision_radius', 0.35)
+        # 0.35 -> 0.45 m, in step with the wider assoc_radius: also used by
+        # merge_pass() to fuse one object that got two names.
+        self.declare_parameter('revision_radius', 0.45)
         # Ceiling on accumulated position weight. This is what keeps a
         # landmark correctable: without it, old distant sightings outvote a
         # close-up correction forever.
@@ -343,8 +435,23 @@ class ObjectMapper(Node):
         # A box appears at `confidence` but, once shown, stays while the
         # detector still sees it at >= display_confidence, and survives brief
         # misses for box_hold_sec. Mapping still uses `confidence` only.
-        self.declare_parameter('display_confidence', 0.12)
+        # 0.12 -> 0.25: a shown box may coast on weaker frames, but not on
+        # near-noise ones.
+        self.declare_parameter('display_confidence', 0.25)
+        # A box only APPEARS on screen at this confidence -- or when it lands
+        # on a CONFIRMED landmark. Was: any detection that touched any
+        # landmark, even one seen once, which is how so many wrong boxes
+        # showed up.
+        self.declare_parameter('box_confidence', 0.45)
         self.declare_parameter('box_hold_sec', 2.0)
+        # --- second opinion ---------------------------------------------------
+        # Every box about to be MAPPED is cropped and classified independently
+        # by CLIP (a vision-language model; see ClipVerifier). It overrules
+        # the detector's name when clearly more confident, and vetoes crops
+        # it sees as bare wall/floor. Continuous, from every viewpoint, so a
+        # landmark's name converges on what the object really is.
+        self.declare_parameter('clip_verify', True)
+        self.declare_parameter('clip_min_prob', 0.60)
         # How long a transient sighting (a person) still counts as "now".
         self.declare_parameter('transient_ttl_sec', 20.0)
         self.declare_parameter('merge_period_sec', 5.0)
@@ -383,9 +490,14 @@ class ObjectMapper(Node):
         self.max_box_area = float(g('max_box_area'))
         self.display_conf = min(self.conf_thresh, float(g('display_confidence')))
         self.box_hold = float(g('box_hold_sec'))
+        self.box_conf = float(g('box_confidence'))
+        self.clip_enabled = bool(g('clip_verify'))
+        self.clip_min_prob = float(g('clip_min_prob'))
+        self.clip = None                # ClipVerifier, loaded with the detector
         self.publish_debug = bool(g('publish_debug_image'))
         self.map_frame = g('map_frame')
         self.objects_dir = g('objects_dir')
+        self._last_saved_count = None
 
         self.vocab, self.synonyms, self.overrides = self.load_vocabulary(g('vocabulary_file'))
         if not self.vocab:
@@ -400,7 +512,7 @@ class ObjectMapper(Node):
         self.landmarks = {}
         self.next_id = 1
         self.stats = {'detections': 0, 'unresolved': 0, 'frames': 0, 'infer_ms': 0.0,
-                      'relabels': 0, 'pruned': 0}
+                      'relabels': 0, 'pruned': 0, 'clip_renamed': 0, 'clip_vetoed': 0}
         # Focal-length samples for auto-calibration (see calibrate()).
         self.fx_samples = deque(maxlen=400)
         self.hfov_source = 'default'
@@ -522,11 +634,18 @@ class ObjectMapper(Node):
             model.set_classes(self.vocab + self.ignore)
             self.model = model
             self.get_logger().info('Detector ready.')
+            if self.clip_enabled:
+                try:
+                    self.clip = ClipVerifier(self.vocab, self.ignore)
+                    self.get_logger().info('CLIP second-opinion check ready.')
+                except Exception as exc:              # noqa: BLE001 - optional
+                    self.get_logger().warn(f'CLIP check unavailable ({exc}); '
+                                           'mapping on the detector alone.')
         except Exception as exc:                      # noqa: BLE001 - report and disable
             self.model_error = str(exc)
             self.get_logger().error(
                 f'Could not start the detector ({exc}). '
-                f'Run scripts/install_deps.sh. Mapping continues without object labels.')
+                f'See "Setup" in README.md. Mapping continues without object labels.')
         return self.model
 
     def detect_loop(self):
@@ -588,6 +707,8 @@ class ObjectMapper(Node):
         cx, cy = w / 2.0, h / 2.0
         points = self.scan_points(scan)
 
+        verdicts = self.second_opinion(img, boxes, names, w, h)
+
         drawn = []
         seen_ids = set()
         weak_labels = set()     # seen, but below the mapping threshold
@@ -606,6 +727,16 @@ class ObjectMapper(Node):
                 drawn.append((x1, y1, x2, y2, label, conf, None, None))
                 weak_labels.add(label)
                 continue
+            verdict = verdicts.get(i)
+            if verdict is not None:
+                clip_label, prob = verdict
+                if clip_label in self.ignore_set:
+                    # CLIP sees bare wall/floor in this crop: not an object.
+                    self.stats['clip_vetoed'] += 1
+                    continue
+                if clip_label != label:
+                    self.stats['clip_renamed'] += 1
+                    label = clip_label
             self.stats['detections'] += 1
 
             # Bbox edges -> two rays -> an angular sector in the scan frame.
@@ -645,6 +776,41 @@ class ObjectMapper(Node):
         self.publish_boxes(camera, w, h, drawn)
         if self.debug_pub is not None:
             self.publish_debug_image(img, drawn, camera)
+
+    def second_opinion(self, img, boxes, names, w, h):
+        """CLIP's verdict for every box that is about to be MAPPED.
+
+        {box index: (label, probability)}, only where CLIP is confident
+        (>= clip_min_prob) -- an unsure second opinion is no opinion, and the
+        detector's own label stands. People are left alone: they move, are
+        never saved, and CLIP on a partly-visible person is unreliable.
+        One batched GPU call per frame.
+        """
+        if self.clip is None:
+            return {}
+        idxs, crops = [], []
+        for i in range(len(boxes)):
+            label = names[int(boxes.cls[i])] if names else None
+            if label is None or self.override(label, 'transient', False):
+                continue
+            conf = float(boxes.conf[i])
+            if conf < float(self.override(label, 'min_confidence', self.conf_thresh)):
+                continue
+            x1, y1, x2, y2 = (float(v) for v in boxes.xyxy[i])
+            if not self.plausible(label, x1, y1, x2, y2, w, h):
+                continue
+            crop = crop_box(img, x1, y1, x2, y2)
+            if crop is not None:
+                idxs.append(i)
+                crops.append(crop)
+        try:
+            results = self.clip.classify(crops)
+        except Exception as exc:                      # noqa: BLE001 - disable, keep mapping
+            self.get_logger().warn(f'CLIP check failed ({exc}); disabling it.')
+            self.clip = None
+            return {}
+        return {i: (lab, p) for i, (lab, p) in zip(idxs, results)
+                if p >= self.clip_min_prob and not self.override(lab, 'transient', False)}
 
     # ----------------------------------------------------------- live boxes
 
@@ -772,8 +938,13 @@ class ObjectMapper(Node):
                 # one: if it was relabelled "bed" -> "sofa", the box says sofa
                 # even on a frame where the detector wobbled back to "bed".
                 label = lm.label if lm is not None else raw_label
-            entry = (conf >= float(self.override(raw_label, 'min_confidence', self.conf_thresh))
-                     or lm is not None)
+            # Appear only when genuinely confident, or when the box sits on a
+            # CONFIRMED landmark (seen min_hits times). Not merely "touched
+            # some landmark once" -- that let every stray guess on screen.
+            min_entry = max(self.box_conf,
+                            float(self.override(raw_label, 'min_confidence', self.conf_thresh)))
+            entry = (conf >= min_entry
+                     or (lm is not None and lm.hits >= self.min_hits))
             dets.append({
                 # Normalised 0..1 so the browser can scale to any view size.
                 'x1': round(max(0.0, x1 / w), 4), 'y1': round(max(0.0, y1 / h), 4),
@@ -1150,9 +1321,16 @@ class ObjectMapper(Node):
                     continue
                 radius = float(self.override(a.label, 'assoc_radius', self.assoc_radius))
                 for b in items[i + 1:]:
-                    if b.id in dead or b.label != a.label:
+                    if b.id in dead or b.transient != a.transient:
                         continue
-                    if math.hypot(a.x - b.x, a.y - b.y) < radius:
+                    d = math.hypot(a.x - b.x, a.y - b.y)
+                    # Same name: merge within the class's association radius.
+                    # DIFFERENT names but practically the same spot (a "desk"
+                    # and a "coffee table" 20 cm apart): one object seen two
+                    # ways -- merge, and the pooled votes pick the name. The
+                    # tight revision radius keeps a chair beside a desk apart.
+                    if (b.label == a.label and d < radius) or \
+                            (not a.transient and d < self.revision_radius):
                         a.absorb(b)
                         dead.add(b.id)
             for lid in dead:
@@ -1183,8 +1361,9 @@ class ObjectMapper(Node):
 
     def publish_objects(self):
         objects = sorted(self.confirmed(), key=lambda l: (l.label, l.id))
+        dicts = number_names([lm.as_dict() for lm in objects])
         payload = {
-            'objects': [lm.as_dict() for lm in objects],
+            'objects': dicts,
             'stats': {
                 'tracked': len(self.landmarks),
                 'confirmed': len(objects),
@@ -1194,6 +1373,9 @@ class ObjectMapper(Node):
                 'infer_ms': round(self.stats['infer_ms'], 1),
                 'relabels': self.stats['relabels'],
                 'pruned': self.stats['pruned'],
+                'clip_renamed': self.stats['clip_renamed'],
+                'clip_vetoed': self.stats['clip_vetoed'],
+                'clip': 'on' if self.clip is not None else 'off',
                 'hfov_deg': round(math.degrees(self.hfov), 1),
                 'hfov_source': self.hfov_source,
                 'calib_samples': len(self.fx_samples),
@@ -1210,9 +1392,10 @@ class ObjectMapper(Node):
         msg = String()
         msg.data = json.dumps(payload)
         self.objects_pub.publish(msg)
-        self.publish_markers(objects)
+        self.publish_markers(objects, {d['id']: d['name'] for d in dicts})
 
-    def publish_markers(self, objects):
+    def publish_markers(self, objects, names=None):
+        names = names or {}
         array = MarkerArray()
         clear = Marker()
         clear.action = Marker.DELETEALL
@@ -1244,7 +1427,7 @@ class ObjectMapper(Node):
             text.pose.orientation.w = 1.0
             text.scale = Vector3(x=0.0, y=0.0, z=0.18)
             text.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=0.95)
-            text.text = lm.label
+            text.text = names.get(lm.id, lm.label)
             text.lifetime = DurationMsg(sec=0)
             array.markers.append(text)
         self.marker_pub.publish(array)
@@ -1279,8 +1462,12 @@ class ObjectMapper(Node):
     def on_save_request(self, msg):
         target = (msg.data or '').strip() or 'qcar_map'
         path = self.save(target)
-        if path:
-            self.get_logger().info(f'Saved {len(self.confirmed())} objects to {path}')
+        # Autosave asks every 10 s; only say so when the object count changed,
+        # so the terminal is not a wall of identical "Saved ..." lines.
+        count = len(self.confirmed())
+        if path and count != self._last_saved_count:
+            self._last_saved_count = count
+            self.get_logger().info(f'Saved {count} objects to {path}')
 
     def save(self, target):
         """Write <map>_objects.json beside the .pgm/.yaml the map saver wrote."""
@@ -1297,12 +1484,15 @@ class ObjectMapper(Node):
             'created': time.strftime('%Y-%m-%dT%H:%M:%S'),
             'vocabulary': self.vocab,
             'synonyms': self.synonyms,
-            'objects': [lm.as_dict() for lm in objects],
+            'objects': number_names([lm.as_dict() for lm in objects]),
         }
         try:
             os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-            with open(path, 'w') as fh:
+            # temp + rename: autosave rewrites this every 10 s, and a reader
+            # (or a Ctrl+C) must never catch a half-written file.
+            with open(path + '.tmp', 'w') as fh:
                 json.dump(payload, fh, indent=2)
+            os.replace(path + '.tmp', path)
         except OSError as exc:
             self.get_logger().error(f'Could not write {path}: {exc}')
             return None

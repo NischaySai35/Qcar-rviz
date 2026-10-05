@@ -95,6 +95,13 @@ synonyms:
 # the same physical object -- big furniture needs a wider gate than a laptop,
 # because the LiDAR hits a different part of a sofa depending on the approach.
 overrides:
+  # Wide/flat objects get wide gates: the LiDAR hits a different part of them
+  # (or the wall behind a wall-mounted TV) from each viewpoint, and a gate
+  # narrower than the object splits it into several landmarks.
+  television:    {assoc_radius: 1.20}
+  computer monitor: {assoc_radius: 0.90}
+  desk:          {assoc_radius: 1.00}
+  cabinet:       {assoc_radius: 1.00}
   sofa:          {assoc_radius: 1.10}
   bed:           {assoc_radius: 1.30}
   dining table:  {assoc_radius: 1.00}

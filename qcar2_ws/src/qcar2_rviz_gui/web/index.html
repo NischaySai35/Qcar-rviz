@@ -383,13 +383,22 @@
           <span style="color:var(--bx-norange)">■</span> seen, but no LiDAR range yet</div>
       </div>
 
+      <!-- Microphone and Ask are navigation-only: mapping runs no voice or
+           assistant node. Voice (the speaker) stays: mapping announces what
+           it finds (see mapping.launch.py). -->
       <div class="card">
         <h3>Voice <span id="voiceState">off</span></h3>
         <button id="voiceBtn" style="width:100%">VOICE OFF</button>
         <div class="row" style="margin-top:8px"><input type="range" id="volume" min="0" max="100" value="50"><span class="num" id="volText" style="flex:0 0 44px;text-align:right">50 %</span></div>
+        <!-- Everything the speaker actually said, newest first, so a sentence
+             that was hard to make out can be read here. -->
+        <div class="heard" id="saidCard">
+          <div class="heard-h">Said</div>
+          <div id="saidLog" class="muted micro">Nothing spoken yet.</div>
+        </div>
       </div>
 
-      <div class="card">
+      <div class="card navonly">
         <h3>Microphone <span id="micState">off</span></h3>
         <button id="micBtn" style="width:100%">MIC OFF</button>
         <div class="row" style="margin-top:8px">
@@ -417,7 +426,7 @@
         <div id="objHint" class="muted micro navonly" style="margin-top:6px">Click one to drive to it.</div>
       </div>
 
-      <div class="card" id="askCard">
+      <div class="card navonly" id="askCard">
         <h3>Ask <span id="askState">—</span></h3>
         <div class="row">
           <input type="text" id="askBox" placeholder="is there a cooler? how many chairs?">
@@ -579,7 +588,7 @@ function onState(m) {
   applyEstop(m.estop); applyCams(m.cams360); applyVoice(m.voice);
   applyMic(m.mic); applyVoiceIn(m.voice_in);
   applyObjects(m.objects, m.object_stats); applyExplore(m.explore);
-  applyAnswers(m.answers); applyDetections(m.detections);
+  applyAnswers(m.answers); applyDetections(m.detections); applySaid(m.spoken);
   $('battery').textContent = m.battery == null ? '—' : m.battery.toFixed(1) + ' V';
   $('speed').textContent = Math.abs(m.speed).toFixed(2);
   $('steer').textContent = steerText(m.steer_cmd);
@@ -726,6 +735,27 @@ function applyAnswers(list) {
   $('askState').textContent = 'answered';
 }
 
+// "Said" card: each sentence the speaker spoke (qcar2_announcer.py publishes
+// it after playback). A failed one is marked, so a silent speaker shows up
+// here instead of looking like the car simply had nothing to say.
+function applySaid(list) {
+  if (!list) return;
+  const key = list.map(e => e.t + '|' + e.text).join('~');
+  if (key === S.saidKey) return;
+  S.saidKey = key;
+  if (!list.length) { $('saidLog').textContent = 'Nothing spoken yet.'; return; }
+  $('saidLog').innerHTML = list.map(e => {
+    const when = new Date(e.t * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+    return `<div class="hl ${e.ok ? 'acted' : 'ignored'}">` +
+      `<span class="muted">${when}</span> <q>${esc(e.text)}</q>` +
+      (e.ok ? '' : `<span class="r">→ not played (speaker error, see terminal)</span>`) + `</div>`;
+  }).join('');
+}
+
+// "sofa 2" etc. -- the numbered name the mapper/object_nav assign to
+// duplicates (older lists without it fall back to the plain class label).
+function objName(o) { return o.name || o.label; }
+
 function esc(t) {
   return String(t == null ? '' : t).replace(/[&<>"']/g,
     c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
@@ -742,7 +772,7 @@ function applyObjects(objects, stats) {
   // Rebuild the list only when it actually changes: this is called on every
   // state push, and replacing the DOM each time would kill hover and make the
   // rows impossible to click.
-  const sig = S.objects.map(o => `${o.label}:${o.x.toFixed(2)},${o.y.toFixed(2)}`).join('|');
+  const sig = S.objects.map(o => `${objName(o)}:${o.x.toFixed(2)},${o.y.toFixed(2)}`).join('|');
   if (sig === S.objectsSig) return;
   S.objectsSig = sig;
   V3.setObjects && V3.setObjects(S.objects);
@@ -757,16 +787,18 @@ function applyObjects(objects, stats) {
   for (const o of S.objects) {
     const row = document.createElement('div');
     row.className = 'objrow';
-    row.textContent = o.label;
+    row.textContent = objName(o);
     const meta = document.createElement('span');
     meta.className = 'objmeta';
     meta.textContent = `${o.x.toFixed(1)}, ${o.y.toFixed(1)}`;
     row.appendChild(meta);
-    row.onmouseenter = () => { S.hoverObject = o.label; };
+    row.onmouseenter = () => { S.hoverObject = objName(o); };
     row.onmouseleave = () => { S.hoverObject = null; };
     if (S.mode === 'navigation') {
       row.classList.add('clickable');
-      row.onclick = () => send({t: 'goto_object', name: o.label});
+      // The numbered name, so clicking "sofa 3" goes to THAT sofa, not the
+      // nearest one.
+      row.onclick = () => send({t: 'goto_object', name: objName(o)});
     }
     list.appendChild(row);
   }
@@ -818,10 +850,22 @@ function mapColor(v, d, o) {
   d[o + 3] = 240;
 }
 // Costmap: 0 free, 1-98 inflation gradient, 99 inscribed, 100 lethal.
+//
+// The inflation now reaches 0.9 m (global) / 0.55 m (local) so the planner
+// steers down the middle of gaps -- see qcar2_slam_and_nav.yaml. Drawn at
+// full strength that is a fat band round every wall, which is what was asked
+// to be thinned before. So only the costly inner part (within ~0.3 m of an
+// obstacle: grid value >= NEAR_COST with the 3.0 slope in that file) keeps
+// the old look; the outer "prefer the middle" zone is a faint wash.
+const NEAR_COST = 57;
 function costColor(v, d, o) {
   if (v === 0 || v === 255) { d[o + 3] = 0; return; }
   if (v === 100) { d[o] = 255; d[o + 1] = 60; d[o + 2] = 120; d[o + 3] = 245; return; }  // lethal  pink-red
   if (v === 99)  { d[o] = 255; d[o + 1] = 140; d[o + 2] = 70; d[o + 3] = 225; return; }  // inscribed  orange
+  if (v < NEAR_COST) {                                                                   // comfort zone  faint
+    d[o] = 90; d[o + 1] = 110; d[o + 2] = 255; d[o + 3] = Math.round(6 + 22 * v / NEAR_COST);
+    return;
+  }
   const t = v / 98;                                                                      // inflation  blue -> violet
   d[o]     = Math.round(60 + 150 * t);
   d[o + 1] = Math.round(90 - 40 * t);
@@ -898,12 +942,12 @@ function drawObjects() {
   for (const o of S.objects) {
     const [sx, sy] = w2s(o.x, o.y);
     if (sx < -60 || sy < -30 || sx > W + 60 || sy > H + 30) continue;
-    const hit = o.label === S.hoverObject;
+    const hit = objName(o) === S.hoverObject;
     ctx.beginPath(); ctx.arc(sx, sy, hit ? 8 : 5.5, 0, Math.PI * 2);
     ctx.fillStyle = hit ? '#7ef9ff' : '#26d9ef';
     ctx.globalAlpha = 0.9; ctx.fill();
     ctx.globalAlpha = 1; ctx.lineWidth = 1.5; ctx.strokeStyle = '#04222a'; ctx.stroke();
-    const text = o.label;
+    const text = objName(o);
     const w = ctx.measureText(text).width;
     ctx.fillStyle = 'rgba(4, 12, 20, 0.78)';
     ctx.fillRect(sx - w / 2 - 4, sy - 22, w + 8, 14);
@@ -1118,7 +1162,9 @@ async function startBrowserMic() {
   }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true},
+      // autoGainControl: a laptop mic held at different distances varies by
+      // 20 dB+, and the recogniser is far happier with a steady level.
+      audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true},
     });
     const actx = new (window.AudioContext || window.webkitAudioContext)();
     const src = actx.createMediaStreamSource(stream);
@@ -1495,12 +1541,13 @@ function setObjects(list) {
       objectMarkers.set(key, m);
     }
     m.group.position.set(o.x, o.y, 0);
-    if (m.label !== o.label) {
+    const name = o.name || o.label;
+    if (m.label !== name) {
       if (m.sprite) { m.group.remove(m.sprite); disposeSprite(m.sprite); }
-      m.sprite = labelSprite(o.label);
+      m.sprite = labelSprite(name);
       m.sprite.position.z = POLE_H + 0.1;
       m.group.add(m.sprite);
-      m.label = o.label;
+      m.label = name;
     }
   });
   for (const [key, m] of objectMarkers) {

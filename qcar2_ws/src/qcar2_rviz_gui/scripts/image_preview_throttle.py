@@ -77,8 +77,11 @@ def main():
             rclpy.spin(node)
         finally:
             node.destroy_node()
-            rclpy.shutdown()
-    except (KeyboardInterrupt, SystemExit):
+            if rclpy.ok():  # ROS's own signal handler may already have shut down
+                rclpy.shutdown()
+    except KeyboardInterrupt:
+        pass                # Ctrl+C is a normal stop, not a crash to report
+    except SystemExit:
         raise
     except Exception:
         with open(_CRASH_LOG, 'a') as f:

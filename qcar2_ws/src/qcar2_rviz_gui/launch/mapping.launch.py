@@ -7,8 +7,8 @@ Usage:
   ros2 launch qcar2_rviz_gui mapping.launch.py
   ros2 launch qcar2_rviz_gui mapping.launch.py use_rviz:=false use_cameras:=false
 
-When you're happy with the map, in another terminal run scripts/save_map.sh
-(or the map_saver_cli command from the README) BEFORE shutting this down.
+Pass map_name:=NAME to autosave maps/NAME.* every 10 s (the scripts do).
+Otherwise save with the console's Save Map button. Ctrl+C itself never saves.
 """
 import os
 
@@ -47,7 +47,7 @@ def generate_launch_description():
     # includes the hold-to-drive pad; RViz and the Tk drive window are opt-in.
     declare_use_web_gui_cmd = DeclareLaunchArgument(
         'use_web_gui', default_value='true',
-        description='Serve the QCar2 browser console (map, drive pad, save map, cameras, voice)')
+        description='Serve the QCar2 browser console (map, drive pad, save map, cameras)')
     declare_web_port_cmd = DeclareLaunchArgument(
         'web_port', default_value='8080', description='Port for the browser console')
     declare_use_rviz_cmd = DeclareLaunchArgument(
@@ -82,6 +82,11 @@ def generate_launch_description():
         description='Drive the car automatically: run Nav2 on the live SLAM map '
                     'and send it frontier goals until the room is covered. '
                     'Use scripts/start_mapping_auto.sh rather than this flag.')
+    # Name the map + objects are AUTOSAVED under every 10 s (same files
+    # overwritten). scripts/start_mapping.sh sets it; empty = no autosave.
+    declare_map_name_cmd = DeclareLaunchArgument(
+        'map_name', default_value='',
+        description='Autosave maps/<map_name>.yaml/.pgm/_objects.json every 10 s')
     declare_nav_params_cmd = DeclareLaunchArgument(
         'params_file',
         default_value=os.path.join(
@@ -90,10 +95,6 @@ def generate_launch_description():
     declare_time_budget_cmd = DeclareLaunchArgument(
         'time_budget_sec', default_value='900.0',
         description='Hard stop for autonomous exploration, seconds')
-    declare_use_voice_cmd = DeclareLaunchArgument(
-        'use_voice', default_value='true',
-        description='Run the spoken-command listener (microphone stays OFF '
-                    'until you turn it on in the browser console)')
 
     qcar2_gui_dir = get_package_share_directory('qcar2_rviz_gui')
     qcar2_nodes_dir = get_package_share_directory('qcar2_nodes')
@@ -116,6 +117,10 @@ def generate_launch_description():
             '-configuration_directory', os.path.join(qcar2_nodes_dir, 'config'),
             '-configuration_basename', 'qcar2_2d.lua',
         ],
+        # Errors only: at info/warn Cartographer prints several lines a second
+        # of internal scan-matching chatter ("constraint_builder ... score",
+        # "Dropped N earlier points") that buries anything that matters.
+        ros_arguments=['--log-level', 'error'],
         condition=UnlessCondition(sensor_fusion),
     )
 
@@ -132,6 +137,7 @@ def generate_launch_description():
             '-configuration_basename', 'qcar2_2d_fused.lua',
         ],
         remappings=[('imu', '/qcar2_imu'), ('odom', '/wheel_imu_odom')],
+        ros_arguments=['--log-level', 'error'],       # see scan_only_cartographer_node
         condition=IfCondition(sensor_fusion),
     )
     fused_cartographer_start = TimerAction(period=4.0, actions=[fused_cartographer_node])
@@ -156,6 +162,7 @@ def generate_launch_description():
         name='cartographer_occupancy_grid_node',
         output='screen',
         arguments=['-resolution', resolution, '-publish_period_sec', '1.0'],
+        ros_arguments=['--log-level', 'error'],
     )
 
     rviz_node = Node(
@@ -182,7 +189,20 @@ def generate_launch_description():
         executable='qcar2_web_gui.py',
         name='qcar2_web_gui',
         output='screen',
-        parameters=[{'mode': 'mapping', 'port': LaunchConfiguration('web_port')}],
+        # cameras_owned: this launch starts all four cameras itself, so the
+        # console must NEVER start its own copies for the 360 view. It used to
+        # guess by counting /rear camera publishers at that instant; a main
+        # camera mid-restart counted as "not running", duplicates were
+        # launched, and the two sets then fought over the devices forever
+        # (dozens of csi restarts a minute, CPU starved, controller late).
+        # nav2_drives: in explore mode Nav2 + nav2_qcar2_converter drive the
+        # motors, so the console must NOT publish its idle zeros straight to
+        # /qcar2_motor_speed_cmd -- see drive_tick() in qcar2_web_gui.py.
+        parameters=[{'mode': 'mapping', 'port': LaunchConfiguration('web_port'),
+                     'cameras_owned': ParameterValue(cameras_on, value_type=bool),
+                     'nav2_drives': ParameterValue(explore, value_type=bool),
+                     'autosave_name': ParameterValue(
+                         LaunchConfiguration('map_name'), value_type=str)}],
         condition=IfCondition(LaunchConfiguration('use_web_gui')),
     )
 
@@ -222,6 +242,11 @@ def generate_launch_description():
             'use_sim_time': 'false',
             'autostart': 'true',
             'params_file': explore_nav_params,
+            # Errors only: Nav2 logs every replan ("Passing new path to
+            # controller", twice a second) and every slow control cycle.
+            # Real failures ("Failed to make progress", planning failures)
+            # are errors and still print; the console shows nav state too.
+            'log_level': 'error',
         }.items(),
         condition=IfCondition(explore),
     )
@@ -258,36 +283,18 @@ def generate_launch_description():
     )
     explorer_start = TimerAction(period=12.0, actions=[explorer_node])
 
-    # Spoken commands. The microphone is OFF until switched on in the browser
-    # console, so this is safe to run always; in mapping mode the useful ones
-    # are "hey car stop"/"cancel" (going to a named object needs Nav2, which
-    # only runs in navigate or explore mode).
-    # Answers questions about the room ("is there a cooler?", "how far is it?",
-    # "how many people are here?") from the landmark map -- see
-    # qcar2_assistant.py. Facts come from the map, never from a language model.
-    assistant_node = Node(
-        package='qcar2_rviz_gui',
-        executable='qcar2_assistant.py',
-        name='qcar2_assistant',
-        output='screen',
-    )
-
-    voice_node = Node(
-        package='qcar2_rviz_gui',
-        executable='qcar2_voice_command.py',
-        name='qcar2_voice_command',
-        output='screen',
-        condition=IfCondition(LaunchConfiguration('use_voice')),
-    )
-
-    # "Mapping started" plus nearby-obstacle callouts through the onboard
-    # speaker -- see qcar2_announcer.py.
+    # Mapping ONLY maps. Voice commands, question answering ("is there a
+    # cooler?") and "go to the sofa" live in navigate.launch.py, where a
+    # finished, saved map with its objects is loaded and the car can act on
+    # it. The one exception is the speaker: spoken callouts of what the car
+    # finds ("television on the left, 2.3 metres", "person ahead", nearby
+    # obstacles). Speaking only -- no microphone runs here, so no echo cancel.
     announcer_node = Node(
         package='qcar2_rviz_gui',
         executable='qcar2_announcer.py',
         name='qcar2_announcer',
         output='screen',
-        parameters=[{'mode': 'mapping'}],
+        parameters=[{'mode': 'mapping', 'echo_cancel': False}],
     )
 
     return LaunchDescription([
@@ -301,9 +308,9 @@ def generate_launch_description():
         declare_sensor_fusion_cmd,
         declare_detect_objects_cmd,
         declare_explore_cmd,
+        declare_map_name_cmd,
         declare_nav_params_cmd,
         declare_time_budget_cmd,
-        declare_use_voice_cmd,
         hardware_launch,
         wheel_imu_odometry_node,
         scan_only_cartographer_node,
@@ -314,8 +321,6 @@ def generate_launch_description():
         web_gui_node,
         announcer_node,
         object_mapper_start,
-        voice_node,
-        assistant_node,
         explore_navigation_launch,
         explore_converter_node,
         explorer_start,

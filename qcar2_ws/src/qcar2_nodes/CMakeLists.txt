@@ -79,7 +79,7 @@ ament_target_dependencies(fixed_lidar_frame_virtual geometry_msgs rclcpp tf2_ros
 # nav2
 # nav2 -> qcar2
 add_executable(nav2_qcar2_converter src/nav2_qcar_command_convert.cpp)
-ament_target_dependencies(nav2_qcar2_converter rclcpp geometry_msgs nav_msgs qcar2_interfaces)
+ament_target_dependencies(nav2_qcar2_converter rclcpp geometry_msgs nav_msgs action_msgs qcar2_interfaces)
 
 # # Install Python modules
 # ament_python_install_package(${PROJECT_NAME})

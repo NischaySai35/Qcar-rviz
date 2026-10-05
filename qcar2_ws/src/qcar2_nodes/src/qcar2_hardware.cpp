@@ -529,6 +529,43 @@ private:
 
         if (desired_speed != 0)
         {
+            // RESUME after a momentary zero.  This loop builds throttle up
+            // gradually (the integrator below), and at a Nav2 cruise of
+            // ~0.1 m/s it takes about a second of UNBROKEN commands to reach
+            // the throttle that breaks the wheels' static friction.  But any
+            // single zero command used to drop motor_speed_cmd straight back
+            // to 0 (the else-branch), and zeros arrive constantly while the
+            // controller runs late: nav2_qcar_command_convert.cpp's watchdog
+            // sends one whenever /cmd_vel_nav is quiet for its timeout.  The
+            // integrator was reset every few hundred milliseconds, never got
+            // there, and the car sat still while being "commanded to move" --
+            // the console's MOTOR NOT RESPONDING banner and the controller's
+            // repeated "Failed to make progress" (38 in one auto-mapping run).
+            //
+            // The stop itself stays instant (zero still means zero throttle,
+            // right now).  Only the RESTART changes: if motion resumes in the
+            // same direction within kResumeWindowSeconds, carry on from the
+            // throttle that had been reached instead of from nothing.
+            if (motor_speed_cmd == 0.0 && resume_pwm_ != 0.0 &&
+                (resume_pwm_ > 0.0) == (desired_speed > 0.0) &&
+                (start_time - zero_since_).seconds() < kResumeWindowSeconds)
+            {
+                motor_speed_cmd = resume_pwm_;
+            }
+            resume_pwm_ = 0.0;
+            // START AT THE DEADBAND EDGE.  Below ~0.03 throttle the motor does
+            // not turn at all (see the deadband note below), yet a fresh start
+            // used to climb there from 0 through the integrator: at a crawl
+            // (0.03-0.1 m/s, i.e. every careful move near an obstacle) that is
+            // 0.5-2 s of commanding motion with nothing happening, which is
+            // exactly the "why does it take so long to do anything" delay.
+            // Jumping straight to the edge costs nothing -- by definition that
+            // throttle barely moves the car -- and the loop takes it from there.
+            if (motor_speed_cmd == 0.0)
+            {
+                motor_speed_cmd = std::copysign(kBreakawayPwm, desired_speed);
+            }
+
             // Channel 14000 ("Motor Speed") is a well-filtered MAGNITUDE and
             // does not reliably carry the direction of travel.  That never
             // mattered while this car was forward-only, but it makes reverse
@@ -569,6 +606,11 @@ private:
         }
         else
         {
+            if (motor_speed_cmd != 0.0)
+            {
+                resume_pwm_ = motor_speed_cmd;      // remembered for a quick resume
+                zero_since_ = start_time;
+            }
             motor_speed_cmd = 0;
         }
 
@@ -953,6 +995,14 @@ private:
     double desired_steering = 0;
     double prior_speed_error =0;
     double motor_speed_cmd = 0;
+    // Throttle the PD integrator had built up when the last zero command
+    // arrived, and when -- see the "resume" block in speed_controller().
+    double resume_pwm_ = 0.0;
+    rclcpp::Time zero_since_{0, 0, RCL_SYSTEM_TIME};
+    static constexpr double kResumeWindowSeconds = 0.5;
+    // Throttle below which the motor does not turn (the "~|0.03|" deadband
+    // noted in speed_controller()); fresh starts begin here, not at 0.
+    static constexpr double kBreakawayPwm = 0.03;
     // Set once the shutdown stop has been written; blocks any further motor
     // writes so the zero cannot be overwritten during teardown.
     std::atomic<bool> motors_stopped_{false};
