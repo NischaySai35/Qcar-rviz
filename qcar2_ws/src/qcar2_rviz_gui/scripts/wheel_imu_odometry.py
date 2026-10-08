@@ -30,12 +30,25 @@ from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from qcar2_interfaces.msg import MotorCommands
 from rclpy.node import Node
+from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
+                       QoSReliabilityPolicy)
 from sensor_msgs.msg import Imu, JointState
+from std_msgs.msg import Bool
 from tf2_ros import TransformBroadcaster
 
 
 WHEEL_RADIUS_M = 0.033
 WHEELBASE_M = 0.256
+# Wheel slip guard for the slippery floor tiles. qcar2_hardware.cpp ramps
+# every speed change at 0.4 m/s^2 up / 0.7 m/s^2 down, so the car itself
+# cannot change speed much faster than that. A wheel speed RISING faster is
+# the tyres spinning (not travel); one FALLING faster is them locking and
+# skidding (the car slides on further than the wheels say). Either way the
+# pose is integrated with the physically possible speed instead. Margins are
+# generous so honest motion is never clipped; a collision, the one real
+# instant stop, is handled by qcar2_bump_guard.py's drive_blocked freeze.
+MAX_ODOM_ACCEL = 1.0
+MAX_ODOM_DECEL = 2.0
 # QCar2 motor encoder -> wheel linear-speed conversion. Keep this identical
 # to qcar2_hardware.cpp's speed controller.
 COUNTS_TO_MPS = ((13.0 * 19.0) / (70.0 * 30.0)) * (2.0 * math.pi * WHEEL_RADIUS_M) / (720.0 * 4.0)
@@ -50,11 +63,19 @@ class WheelImuOdometry(Node):
         self.create_subscription(JointState, '/qcar2_joint', self._joint, 20)
         self.create_subscription(Imu, '/qcar2_imu', self._imu, 50)
         self.create_subscription(MotorCommands, '/qcar2_motor_speed_cmd', self._command, 20)
+        # Set by qcar2_bump_guard.py while the car is pressed against
+        # something (stalled, or wheels spinning in place). While it is set
+        # the wheels' "travel" is fiction: integrating it drove the odom pose
+        # forward through the glass, and Cartographer -- which takes its
+        # motion prior from this -- dragged the whole map with it.
+        latched = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE,
+                             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                             history=QoSHistoryPolicy.KEEP_LAST)
+        self.create_subscription(Bool, '/qcar2/drive_blocked', self._blocked, latched)
+        self.blocked = False
+        self.travel_speed = 0.0
 
         self.counts_per_second = None
-        self.encoder_count = None
-        self.previous_encoder_count = None
-        self.speed_sign = 1.0
         self.gyro_z = None
         self.steering = 0.0
         self.gyro_bias_sum = 0.0
@@ -66,16 +87,16 @@ class WheelImuOdometry(Node):
         self.create_timer(0.02, self._publish)
 
     def _joint(self, message):
+        # SIGNED counts/s: qcar2_hardware.cpp publishes channel 14000's
+        # magnitude with the direction the motor is being driven in.
         if message.velocity:
             self.counts_per_second = message.velocity[0]
-        # Quadrature encoder count. Unlike the motor-speed channel this is
-        # unambiguously SIGNED, so it is the reliable source of travel
-        # direction -- see _signed_speed().
-        if message.position:
-            self.encoder_count = message.position[0]
 
     def _imu(self, message):
         self.gyro_z = message.angular_velocity.z
+
+    def _blocked(self, message):
+        self.blocked = bool(message.data)
 
     def _command(self, message):
         try:
@@ -84,32 +105,19 @@ class WheelImuOdometry(Node):
             pass
 
     def _signed_speed(self, dt):
-        """Wheel speed in m/s, with the sign taken from the encoder.
+        """Wheel speed in m/s, signed (negative = reversing).
 
-        qcar2_hardware publishes velocity[0] from Quanser channel 14000
-        ("Motor Speed"), whose magnitude is well filtered but which cannot be
-        relied on to carry the direction of travel.  That never mattered while
-        the car was forward-only, but reverse is now a normal manoeuvre: an
-        unsigned speed integrates the pose FORWARD while the car actually
-        backs up, which corrupts odometry, the controller's feedback, and the
-        steering-bias learner in nav2_qcar_command_convert.cpp all at once.
-
-        position[0] is the quadrature encoder count and is properly signed, so
-        its delta gives direction unambiguously.  Magnitude still comes from
-        the filtered speed channel; only the sign is taken from the encoder,
-        and the last known sign is held through the noise around standstill.
+        An unsigned speed integrates the pose FORWARD while the car backs up.
+        This used to take the sign from the encoder count (position[0]),
+        assumed to be a signed quadrature count -- but the 2026-10-07 speed
+        log shows it reading positive while reversing, so every reverse leg
+        drove the odometry forward, AMCL kept re-anchoring map->odom against
+        the LiDAR, and the whole map visibly shifted on any goal after the
+        first.  qcar2_hardware.cpp now publishes velocity[0] already signed
+        from the direction the motor is being driven (a DC motor cannot
+        reverse without stopping, so that is unambiguous).
         """
-        magnitude = abs(self.counts_per_second * COUNTS_TO_MPS)
-
-        if self.encoder_count is not None and dt > 0.0:
-            if self.previous_encoder_count is not None:
-                delta = self.encoder_count - self.previous_encoder_count
-                # Ignore encoder dither while stationary; hold the last sign.
-                if abs(delta * COUNTS_TO_MPS / dt) > 0.01:
-                    self.speed_sign = 1.0 if delta >= 0.0 else -1.0
-            self.previous_encoder_count = self.encoder_count
-
-        return magnitude * self.speed_sign
+        return self.counts_per_second * COUNTS_TO_MPS
 
     def _publish(self):
         now = time.monotonic()
@@ -139,9 +147,21 @@ class WheelImuOdometry(Node):
         else:
             yaw_rate = linear_speed * math.tan(self.steering) / WHEELBASE_M
 
+        # Pose integration uses the slip-guarded speed; the published twist
+        # stays the raw wheel speed, which qcar2_bump_guard.py compares
+        # against the LiDAR to detect slip in the first place.
+        speeding_up = abs(linear_speed) > abs(self.travel_speed) and \
+            linear_speed * self.travel_speed >= 0.0
+        step = (MAX_ODOM_ACCEL if speeding_up else MAX_ODOM_DECEL) * dt
+        travel_speed = min(max(linear_speed, self.travel_speed - step),
+                           self.travel_speed + step)
+        if self.blocked:
+            travel_speed = 0.0
+        self.travel_speed = travel_speed
+
         mid_yaw = self.yaw + 0.5 * yaw_rate * dt
-        self.x += linear_speed * math.cos(mid_yaw) * dt
-        self.y += linear_speed * math.sin(mid_yaw) * dt
+        self.x += travel_speed * math.cos(mid_yaw) * dt
+        self.y += travel_speed * math.sin(mid_yaw) * dt
         self.yaw = math.atan2(math.sin(self.yaw + yaw_rate * dt),
                               math.cos(self.yaw + yaw_rate * dt))
 

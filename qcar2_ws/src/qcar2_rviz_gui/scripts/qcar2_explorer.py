@@ -56,6 +56,7 @@ from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration as DurationMsg
 from geometry_msgs.msg import Point, PoseStamped, Vector3
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.msg import SpeedLimit
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.executors import ExternalShutdownException
@@ -109,7 +110,7 @@ class Explorer(Node):
         self.declare_parameter('max_failures_per_frontier', 2)
         self.declare_parameter('goal_timeout_sec', 60.0)
         self.declare_parameter('planning_period_sec', 2.0)
-        self.declare_parameter('time_budget_sec', 900.0)
+        self.declare_parameter('time_budget_sec', 1800.0)
         self.declare_parameter('finish_settle_sec', 6.0)
         # Distance/size trade. Higher = greedier about going to the nearest
         # frontier; lower = more willing to cross the room for a big one.
@@ -126,19 +127,25 @@ class Explorer(Node):
         # Failed frontiers are retried after this long: the map keeps growing,
         # and a frontier that was unreachable a minute ago often is not now.
         self.declare_parameter('blacklist_ttl_sec', 120.0)
-        # TWO PHASES. Exploring every frontier equally sent the car poking
-        # into every gap under a chair and behind a cabinet. Instead:
-        #   main   -- only big openings (>= main_min_cells of frontier, i.e.
-        #             1 m at 5 cm cells) whose goal has main_clearance of room:
-        #             the open body of the room, driven comfortably.
-        #   detail -- afterwards, smaller openings (>= detail_min_cells) that
-        #             can be reached with wall_clearance (the 40 cm rule), for
-        #             at most detail_budget_sec. Anything smaller is never
-        #             chased: it is under or behind furniture.
-        self.declare_parameter('main_min_cells', 20)
+        # The old TWO PHASES (big openings only, then smaller ones for at most
+        # 180 s, anything smaller never chased) wrote places off from the map
+        # without going there. Replaced by the try-first tiers in tick(); the
+        # comfortable clearance survives as the first rung of reachable_spot().
         self.declare_parameter('main_clearance', 0.55)
-        self.declare_parameter('detail_min_cells', 10)
-        self.declare_parameter('detail_budget_sec', 180.0)
+        # Exploration drives slower than navigation (0.45 m/s). Cartographer
+        # matches each scan against the map near where the odometry says the
+        # car is; the less the car moves and turns between scans, the smaller
+        # that guess's error and the cleaner the walls, especially in turns.
+        # Slower also means gentler starts/stops on the slippery tiles.
+        # Sent to Nav2 as an absolute /speed_limit with every goal.
+        # 0.30 -> 0.20 on 2026-10-06 ("still pretty fast while mapping").
+        self.declare_parameter('max_speed', 0.20)
+        # While the room analyzer reports the live scan no longer lines up
+        # with the map (smear, drift), crawl so Cartographer can re-anchor.
+        self.declare_parameter('poor_quality_speed', 0.12)
+        # How long to stand still at a reached gap while the vision model
+        # looks around (it releases us sooner via /qcar2/look_done).
+        self.declare_parameter('look_timeout_sec', 25.0)
 
         g = lambda n: self.get_parameter(n).value
         self.map_frame = g('map_frame')
@@ -158,13 +165,11 @@ class Explorer(Node):
         self.unknown_backoff = float(g('unknown_backoff'))
         self.approach_radius = float(g('approach_radius'))
         self.blacklist_ttl = float(g('blacklist_ttl_sec'))
-        self.phases = {
-            'main': (int(g('main_min_cells')), float(g('main_clearance'))),
-            'detail': (int(g('detail_min_cells')), self.wall_clearance),
-        }
-        self.detail_budget = float(g('detail_budget_sec'))
-        self.phase = 'main'
-        self.detail_started = None
+        self.main_clearance = float(g('main_clearance'))
+        self.max_speed = float(g('max_speed'))
+        self.poor_quality_speed = float(g('poor_quality_speed'))
+        self.look_timeout = float(g('look_timeout_sec'))
+        self.phase = 'visit'                 # which try-first tier, for the console
 
         self.map = None
         self.enabled = True
@@ -195,10 +200,38 @@ class Explorer(Node):
         self.status_pub = self.create_publisher(String, '/qcar2/explore_status', LATCHED)
         self.say_pub = self.create_publisher(String, '/qcar2/say', 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/qcar2/frontier_markers', 1)
+        self.speed_limit_pub = self.create_publisher(SpeedLimit, '/speed_limit', 1)
 
         self.create_subscription(OccupancyGrid, '/map', self.on_map, 1)
         self.create_subscription(Bool, '/qcar2_estop', self.on_estop, LATCHED)
         self.create_subscription(Bool, '/qcar2/explore_enabled', self.on_enabled, LATCHED)
+        self.create_subscription(Bool, '/qcar2/drive_blocked', self.on_blocked, LATCHED)
+        self.blocked = False
+        # ROOM AWARENESS (2026-10-06). qcar2_room_analyzer.py measures the room
+        # from the map -- outline, coverage, which gaps are worth visiting --
+        # and owns the stop rule. qcar2_explore_vlm.py looks through the
+        # cameras for what geometry cannot know (glass, doorways, gaps under
+        # furniture) and sends skip regions. This node still does the driving.
+        self.create_subscription(String, '/qcar2/room_status', self.on_room_status, LATCHED)
+        self.create_subscription(String, '/qcar2/explore_hints', self.on_hints, LATCHED)
+        self.create_subscription(String, '/qcar2/look_done', self.on_look_done, 10)
+        self.event_pub = self.create_publisher(String, '/qcar2/explore_event', 10)
+        # The operator's drive pad has absolute authority: while they drive,
+        # the exploration goal is cancelled (so Nav2 has nothing to fight
+        # them with) and exploring resumes `manual_resume_sec` after release.
+        self.create_subscription(Bool, '/qcar2/manual_drive_active', self.on_manual, 10)
+        self.path = []                       # where the car has been (try-first rule)
+        self.tried_radius = 0.8
+        self.manual = False
+        self.manual_released = 0.0
+        self.manual_resume = 2.0
+        self.ignore_result = False
+        self.room = None
+        self.room_at = 0.0
+        self.skip_regions = []
+        self.event_id = 0
+        self.looking = None                  # (event id, deadline) while the VLM looks
+        self.quality_poor = False
 
         self.nav = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self.create_timer(float(g('planning_period_sec')), self.tick)
@@ -217,6 +250,85 @@ class Explorer(Node):
             self.get_logger().warn('E-stop engaged -- cancelling the exploration goal.')
             self.cancel_goal()
         self.estop = engaged
+
+    def on_blocked(self, msg):
+        """The car ran into something the LiDAR cannot see (qcar2_bump_guard.py).
+
+        Typically glass: the LiDAR maps the room BEHIND it as free space, so
+        the frontier out there looks reachable and Nav2 keeps pushing the
+        nose into the pane. Abandon the goal at once and blacklist that
+        frontier outright, rather than waiting out goal_timeout_sec (60 s of
+        shoving) and then retrying it. The bump guard has already put the
+        glass on the costmap, so the next plan goes around it.
+        """
+        blocked = bool(msg.data)
+        if blocked and not self.blocked and (self.goal_handle is not None or self.goal_pending):
+            self.get_logger().warn('Car is blocked by something unseen -- abandoning this '
+                                   'frontier and blacklisting it.')
+            if self.current_goal:
+                for _ in range(self.max_failures):
+                    self.strike(*self.current_goal)
+            self.failed += 1
+            self.cancel_goal()
+            self.idle('blocked', 'bumped into something the LiDAR cannot see (glass?)')
+            self.event('blocked')
+        self.blocked = blocked
+
+    def on_manual(self, msg):
+        active = bool(msg.data)
+        if active and not self.manual:
+            self.get_logger().info('Operator took manual control -- exploration stands by.')
+            if self.goal_handle is not None or self.goal_pending:
+                self.ignore_result = True    # cancelled by the operator, not a failure
+            self.cancel_goal()
+            self.looking = None
+        elif not active and self.manual:
+            self.manual_released = time.monotonic()
+            self.get_logger().info(f'Operator released control -- resuming in '
+                                   f'{self.manual_resume:.0f} s from here.')
+        self.manual = active
+
+    def on_room_status(self, msg):
+        try:
+            self.room = json.loads(msg.data)
+        except ValueError:
+            return
+        self.room_at = time.monotonic()
+        poor = bool(self.room.get('quality_poor'))
+        if poor != self.quality_poor:
+            self.quality_poor = poor
+            self.get_logger().warn('Map quality dropped -- slowing down to let the map re-anchor.'
+                                   if poor else 'Map quality recovered.')
+            self.publish_speed_limit()
+
+    def on_hints(self, msg):
+        try:
+            self.skip_regions = json.loads(msg.data).get('skip_regions', [])
+        except ValueError:
+            pass
+
+    def on_look_done(self, msg):
+        if self.looking and msg.data == str(self.looking[0]):
+            self.looking = None
+
+    def event(self, kind, **extra):
+        """Tell qcar2_explore_vlm.py what just happened; returns the event id."""
+        self.event_id += 1
+        car = self.car_xy()
+        data = {'id': self.event_id, 'type': kind,
+                'x': car[0] if car else None, 'y': car[1] if car else None}
+        data.update(extra)
+        msg = String()
+        msg.data = json.dumps(data)
+        self.event_pub.publish(msg)
+        return self.event_id
+
+    def publish_speed_limit(self):
+        limit = SpeedLimit()
+        limit.header.stamp = self.get_clock().now().to_msg()
+        limit.percentage = False
+        limit.speed_limit = self.poor_quality_speed if self.quality_poor else self.max_speed
+        self.speed_limit_pub.publish(limit)
 
     def on_enabled(self, msg):
         want = bool(msg.data)
@@ -293,6 +405,43 @@ class Explorer(Node):
             cx = arr[:, 1].mean() * info.resolution + info.origin.position.x
             clusters.append((cx, cy, len(members)))
         return clusters
+
+    def record_path(self, car):
+        if not self.path or math.hypot(car[0] - self.path[-1][0],
+                                       car[1] - self.path[-1][1]) > 0.3:
+            self.path.append(car)
+
+    def tried(self, x, y):
+        """The car has been near it (or stood at it and looked): done.
+        Gaps the vision model judged from close up on arrival (under
+        furniture, a wall) were by definition visited, so they count too."""
+        if any(math.hypot(x - px, y - py) < self.tried_radius for px, py in self.path):
+            return True
+        return any(math.hypot(x - s['x'], y - s['y']) < s.get('r', 0.6)
+                   for s in getattr(self, 'skip_regions', [])
+                   if not s.get('reason', '').startswith('vision review'))
+
+    def review_skipped(self, x, y):
+        """A map review (no visit) said skip: tried last, never dropped."""
+        return any(math.hypot(x - s['x'], y - s['y']) < s.get('r', 0.6)
+                   for s in getattr(self, 'skip_regions', [])
+                   if s.get('reason', '').startswith('vision review'))
+
+    def reachable_spot(self, fx, fy):
+        """Somewhere free to stop near the target. Rather than giving up when
+        there is no roomy spot right beside it, relax step by step: tighter
+        clearance first (down to the car's own safety margin), then further
+        away -- getting NEAR it and looking is the point."""
+        for radius in (self.approach_radius, 3.0):
+            for clearance in (self.main_clearance, self.wall_clearance, 0.30):
+                saved, self.approach_radius = self.approach_radius, radius
+                try:
+                    goal = self.approach_goal(fx, fy, clearance)
+                finally:
+                    self.approach_radius = saved
+                if goal is not None:
+                    return goal
+        return None
 
     def blacklisted(self, x, y):
         now = time.monotonic()
@@ -410,6 +559,10 @@ class Explorer(Node):
             return self.idle('paused', 'emergency stop is engaged -- release it to continue')
         if not self.enabled:
             return self.idle('paused', 'paused from the console')
+        if self.manual:
+            return self.idle('manual', 'you are driving -- exploring resumes when you let go')
+        if time.monotonic() - self.manual_released < self.manual_resume:
+            return self.idle('manual', 'resuming after manual driving')
         if self.map is None:
             return self.idle('waiting', 'waiting for the first map from Cartographer')
         if not self.nav.server_is_ready():
@@ -430,45 +583,67 @@ class Explorer(Node):
                     self.strike(*self.current_goal)
                 self.failed += 1
                 self.cancel_goal()
+                self.event('failed')
             return
 
-        frontiers = self.find_frontiers()
+        # Standing at a reached gap while the vision model looks around.
+        if self.looking:
+            if time.monotonic() < self.looking[1]:
+                return self.idle('looking', 'looking around with the cameras')
+            self.looking = None
+
+        # TRY FIRST, DECIDE AFTER (operator, 2026-10-06): "it should try and go
+        # near it and then see" -- nothing is written off from the map alone.
+        # Everything the room analyzer found is a target, in three tiers:
+        #   0  worth visiting  -- open gaps, floor not seen up close yet;
+        #   1  probably not    -- what used to be skipped outright: under or
+        #                         behind furniture, along a wall, inside
+        #                         furniture. Still tried, after tier 0;
+        #   2  vision review said skip -- tried last, not never.
+        # A target is TRIED once the car has passed within tried_radius of it
+        # (self.path), and only given up after real failed attempts (strikes)
+        # or when there is no free spot to stop anywhere near it. Only "too
+        # small to matter" specks (< ~0.4 m of edge) and "outside" (beyond a
+        # doorway, go_next_room) are left out. Without the analyzer, fall
+        # back to every frontier, as before.
+        room = self.room if self.room and time.monotonic() - self.room_at < 8.0 else None
+        self.record_path(car)
+        tiers = ([], [], [])
+        if room:
+            for f in room.get('frontiers', []):
+                if f['status'] == 'outside' or f['reason'] == 'too small to matter':
+                    continue
+                tier = 0 if f['status'] == 'visit' else 1
+                if self.review_skipped(f['x'], f['y']):
+                    tier = 2
+                tiers[tier].append((f['x'], f['y'], f['size']))
+        else:
+            tiers[0].extend(self.find_frontiers())
+        tiers = tuple([t for t in tier if not self.tried(t[0], t[1])] for tier in tiers)
+        frontiers = tiers[0] + tiers[1] + tiers[2]
         self.frontier_count = len(frontiers)
         self.publish_frontier_markers(frontiers)
 
-        # Best frontier that we can actually park near. One that has nowhere
-        # safe to stop (e.g. a gap between two chair legs) gets a strike and we
-        # fall through to the next, rather than sending Nav2 a doomed goal.
-        if self.phase == 'detail' and \
-                time.monotonic() - self.detail_started > self.detail_budget:
-            return self.finish('main area mapped; time for the smaller corners used up')
-        min_cells, clearance = self.phases[self.phase]
         target = None
-        for fx, fy, size, dist in self.rank(frontiers, car, min_cells):
-            goal = self.approach_goal(fx, fy, clearance)
-            if goal is None:
-                self.strike(fx, fy)
-                continue
-            if math.hypot(goal[0] - car[0], goal[1] - car[1]) < self.min_goal_distance:
-                # Already as close as we can usefully get; the LiDAR is
-                # looking at it right now. Count it and move on.
-                self.strike(fx, fy)
-                continue
-            target = (fx, fy, size, goal)
-            break
-
-        if target is None and self.phase == 'main':
-            # The open body of the room is done. Now the smaller, still
-            # easy-to-reach openings, with a fresh blacklist (a spot that was
-            # too tight for the main phase's clearance may be fine now).
-            self.phase = 'detail'
-            self.detail_started = time.monotonic()
-            self.blacklist = []
-            self.get_logger().info('Main area mapped; now the smaller openings that are '
-                                   'easy to reach.')
-            if self.announce:
-                self.say('Main area mapped. Checking the remaining corners.')
-            return self.idle('searching', 'main area done; looking at smaller openings')
+        for tier_no, tier in enumerate(tiers):
+            for fx, fy, size, dist in self.rank(tier, car, 0):
+                goal = self.reachable_spot(fx, fy)
+                if goal is None:
+                    # Nowhere free to stop within 3 m, even with the tightest
+                    # clearance: it cannot be reached. That is a real answer.
+                    self.strike(fx, fy)
+                    continue
+                if math.hypot(goal[0] - car[0], goal[1] - car[1]) < self.min_goal_distance:
+                    # The closest spot to stop is where the car already is:
+                    # it is being looked at right now. Tried.
+                    self.path.append((fx, fy))
+                    continue
+                target = (fx, fy, size, goal)
+                break
+            if target is not None:
+                self.phase = ('visit', 'checking places that are probably empty',
+                              'checking places the review skipped')[tier_no]
+                break
 
         if target is None:
             if self.blacklist and not self.retried:
@@ -483,7 +658,9 @@ class Explorer(Node):
             if self.empty_since is None:
                 self.empty_since = time.monotonic()
             elif time.monotonic() - self.empty_since > self.finish_settle:
-                return self.finish('no reachable frontiers left')
+                if room and room.get('done'):
+                    return self.finish(room.get('done_reason') + '; every place tried')
+                return self.finish('every reachable place tried')
             return self.idle('searching', f'{len(frontiers)} frontiers, none reachable yet')
         self.empty_since = None
 
@@ -508,6 +685,7 @@ class Explorer(Node):
         goal.pose.pose.position.y = float(y)
         z, w = yaw_to_quaternion(yaw)
         goal.pose.pose.orientation.z, goal.pose.pose.orientation.w = z, w
+        self.publish_speed_limit()
         self.goal_sent_at = time.monotonic()
         self.goal_pending = True
         future = self.nav.send_goal_async(goal)
@@ -538,8 +716,19 @@ class Explorer(Node):
         except Exception as exc:             # noqa: BLE001 - keep exploring
             self.get_logger().warn(f'Goal result error: {exc}')
         self.goal_handle = None
+        if self.ignore_result:
+            self.ignore_result = False       # the operator cancelled it; no strike
+            self.current_goal = None
+            return
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.visited += 1
+            # Stand still briefly so the vision model can look around from
+            # here (sharp images, the car facing the area it came to see).
+            # The car is facing the frontier, so its front-camera verdict is
+            # about exactly that gap.
+            fx, fy = self.current_goal if self.current_goal else (None, None)
+            eid = self.event('arrived', fx=fx, fy=fy)
+            self.looking = (eid, time.monotonic() + self.look_timeout)
         else:
             # Aborted/cancelled: mark it so we do not keep retrying a frontier
             # this Ackermann car physically cannot reach.
@@ -570,6 +759,8 @@ class Explorer(Node):
             f'{self.failed} failed.')
         self.state = 'finished'
         self.reason = reason
+        # The vision model writes and speaks the final report from this.
+        self.event('finished', reason=reason)
         if self.visited == 0:
             # Nothing was ever reached. Driving "home" would just produce a
             # GOAL REACHED on the spot it is already sitting on -- which

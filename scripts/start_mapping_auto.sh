@@ -17,6 +17,15 @@
 #   5. Then everything shuts down by itself, LiDAR spun down, and this
 #      script exits -- ready for scripts/start_navigate.sh.
 #
+# ROOM AWARENESS: qcar2_room_analyzer.py tracks the room outline and how much
+# of it is mapped, and finishes at 90 % (or 80 % once progress stalls);
+# qcar2_explore_vlm.py looks through the cameras with the vision model
+# (Cosmos-Reason2: the 8B once fully downloaded, else the 2B) for glass,
+# doorways and gaps not worth visiting, and reads out a final report.
+# Only the starting room is mapped; to follow doorways into other rooms:
+#   scripts/start_mapping_auto.sh my_map go_next_room:=true
+# Other switches: use_llm:=false (geometry only), llm_size:=2B|8B.
+#
 # Watch it from http://<car-ip>:8080 while it runs. You can take over at any
 # time: the E-STOP button pauses it, the drive pad overrides it.
 #
@@ -32,7 +41,10 @@ if [ $# -gt 0 ]; then shift; fi
 EXTRA_ARGS=("$@")
 
 # --- tuning -----------------------------------------------------------------
-TIME_BUDGET=900          # hard stop for exploration, seconds
+# Hard stop for exploration, seconds. 900 -> 1800 (2026-10-06): the car now
+# TRIES every place (try-first) at 0.20 m/s with a camera look at each stop,
+# which takes longer; it still ends sooner once everything has been tried.
+TIME_BUDGET=1800
 STARTUP_TIMEOUT=120      # max wait for the hardware node
 NAV_TIMEOUT=90           # max extra wait for Nav2 to activate
 # ----------------------------------------------------------------------------

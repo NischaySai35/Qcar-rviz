@@ -75,12 +75,36 @@ TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.10
 -- In a bare room centre, parallel/distant walls do not constrain every pose
 -- direction. Require stronger scan evidence before moving away from the
 -- encoder/gyro prior, so an ambiguous scan cannot rotate or duplicate a map.
-TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 0.12
-TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window = math.rad(12.)
+--
+-- linear_search_window was 0.12 m. The real-time matcher only looks for the
+-- scan's true position within this distance of where the wheel odometry
+-- predicts the car is. Wheel odometry is exactly what goes wrong when this
+-- car misbehaves: wheels spinning against glass, or a throttle burst that
+-- breaks traction, made it claim 20-50 cm the car never travelled. With a
+-- 12 cm window the true pose was simply outside the search, the scan was
+-- inserted at the wrong place, and every later scan was matched against that
+-- smeared map -- the "map shifts when it stutters, then it only gets worse"
+-- failure from 2026-10-06. 0.20 m recovers a slip of up to 20 cm on its own.
+-- Angle needs no extra room: heading comes from the gyro, which wheel slip
+-- does not affect, so the angular window is trimmed to pay for the wider
+-- linear one (search cost is linear x linear x angular).
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.linear_search_window = 0.20
+TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window = math.rad(8.)
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.translation_weight = 30.
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.rotation_weight = 80.
 
 POSE_GRAPH.constraint_builder.min_score = 0.65
 POSE_GRAPH.constraint_builder.global_localization_min_score = 0.7
+
+-- In the global optimisation, wheel odometry between nodes was weighted
+-- equally with the scan-matched local poses (both default 1e5). When the
+-- odometry was wrong (slip, a collision), every optimisation pass split the
+-- difference between "the wheels say we moved 40 cm" and "the LiDAR says we
+-- did not", and the whole finished map visibly jumped. The scan-matched pose
+-- already contains the odometry as its starting guess, so the translation
+-- term gets a much lower weight; the rotation term stays high because it
+-- comes from the gyro and is trustworthy.
+POSE_GRAPH.optimization_problem.odometry_translation_weight = 1e3
+POSE_GRAPH.optimization_problem.odometry_rotation_weight = 1e5
 
 return options

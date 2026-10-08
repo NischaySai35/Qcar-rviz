@@ -3,8 +3,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <memory>
 #include <map>
 #include <string>
@@ -18,6 +21,8 @@
 #include "sensor_msgs/msg/battery_state.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
+#include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/float32_multi_array.hpp"
 
 #include "qcar2_interfaces/msg/motor_commands.hpp"
 #include "qcar2_interfaces/msg/boolean_leds.hpp"
@@ -246,6 +251,25 @@ public:
         battery_state_publisher_ = this->create_publisher<sensor_msgs::msg::BatteryState>("qcar2_battery", 1, pub_options);
         imu_publisher_ = this->create_publisher<sensor_msgs::msg::Imu>("qcar2_imu", 1, pub_options);
         joint_state_publisher_ = this->create_publisher<sensor_msgs::msg::JointState>("qcar2_joint", 1, pub_options);
+        // true while the throttle is cut because the wheels are blocked --
+        // see drive_throttle().  Latched so a late subscriber sees the state.
+        stall_publisher_ = this->create_publisher<std_msgs::msg::Bool>(
+            "/qcar2/drive_stalled", rclcpp::QoS(1).transient_local());
+        // E-stop: the only stop allowed to skip the smooth setpoint ramp.
+        estop_subscriber_ = this->create_subscription<std_msgs::msg::Bool>(
+            "/qcar2_estop", rclcpp::QoS(1).transient_local(),
+            [this](const std_msgs::msg::Bool &msg) { estop_engaged_ = msg.data; });
+        // [front, rear] metres the car can travel before a bumper meets an
+        // obstacle, from qcar2_bump_guard.py -- see target_speed().
+        clearance_subscriber_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+            "/qcar2/obstacle_clearance", 10,
+            [this](const std_msgs::msg::Float32MultiArray &msg) {
+                if (msg.data.size() < 2)
+                    return;
+                clearance_front_ = msg.data[0];
+                clearance_rear_ = msg.data[1];
+                clearance_stamp_ns_ = clock_.now().nanoseconds();
+            });
 
         // Create the subscribers
         led_cmd_subscriber_ = this->create_subscription<qcar2_interfaces::msg::BooleanLeds>("qcar2_led_cmd", 1, std::bind(&QCar2::led_command_callback, this, _1), sub_options);
@@ -319,6 +343,7 @@ public:
         // the previous throttle after this write.
         desired_speed = 0;
         desired_steering = 0;
+        setpoint_ = 0;
         motor_speed_cmd = 0;
         motors_stopped_ = true;
 
@@ -417,24 +442,42 @@ private:
         }
     }
 
-    // +1.0 forward, -1.0 reverse, taken from the signed motor encoder count.
-    // The last known direction is held through the count dither around
-    // standstill so the sign cannot chatter while the car is stopped.
+    // Wheel speed MAGNITUDE (m/s) from the motor encoder count over one tick.
     // Resolution is not a concern: 1 m/s is ~118,000 counts/s, so even a
     // 0.05 m/s crawl moves ~88 counts in one 15 ms control period.
-    double travel_direction(double dt)
+    //
+    // The encoder does NOT give the direction of travel.  It was assumed to
+    // be a signed quadrature count, but the 2026-10-07 navigation speed log
+    // shows it reading POSITIVE while the car reversed (throttle -0.084,
+    // "speed" +0.32 m/s).  Every consumer that took its sign from it --
+    // this loop, the steering-bias learner and wheel_imu_odometry.py --
+    // counted reversing as driving forward.  On the first goal (forward)
+    // that was harmless; on the next one Hybrid-A* chose reverse, the
+    // odometry ran forward while the LiDAR saw the car go back, AMCL kept
+    // dragging map->odom to reconcile them ("the whole map shifts"), and
+    // the goal failed.  Direction now comes from update_travel_direction().
+    void update_encoder_speed(double dt)
     {
         const t_int32 count = motor_encoder_count_.load();
         if (dt > 0.0 && have_encoder_count_)
         {
             const double counts_per_second = (count - previous_encoder_count_) / dt;
-            const double speed = (counts_per_second/(720.0*4.0))*((13.0*19.0)/(70.0*30.0))*(2.0*M_PI)*0.033;
-            if (std::abs(speed) > 0.01)
-                travel_direction_ = (speed >= 0.0) ? 1.0 : -1.0;
+            encoder_speed_ = std::abs((counts_per_second/(720.0*4.0))*((13.0*19.0)/(70.0*30.0))*(2.0*M_PI)*0.033);
         }
         previous_encoder_count_ = count;
         have_encoder_count_ = true;
-        return travel_direction_;
+    }
+
+    // +1.0 forward, -1.0 reverse, from what the MOTOR IS BEING DRIVEN to do.
+    // A DC motor cannot change direction without passing through rest, so:
+    // while the wheels turn, hold the direction; only when they are (nearly)
+    // stopped take it from the sign of the throttle now being applied.  The
+    // brake drag (reverse throttle while still rolling forward) therefore
+    // cannot flip it early.  Published to /qcar2_joint for the odometry.
+    void update_travel_direction(double speed_magnitude)
+    {
+        if (speed_magnitude < kStallSpeed && std::abs(motor_speed_cmd) >= kBreakawayPwm)
+            travel_direction_ = (motor_speed_cmd > 0.0) ? 1.0 : -1.0;
     }
 
     // Persisted steering centre-bias.  This car's steering linkage is
@@ -487,7 +530,11 @@ private:
         // would otherwise leak straight into the learned steering bias.
         if (!gyro_bias_ready_)
             return;
-        if (std::abs(signed_speed) < kMinLearnSpeed)
+        // FORWARD ONLY (the same rule as the converter's old learner): the
+        // fault is in the linkage so forward data covers reverse too, and
+        // reverse is where the speed sign was wrong until 2026-10-07 -- a
+        // flipped sign inverts atan(L*w/v) and drags the bias the wrong way.
+        if (signed_speed < kMinLearnSpeed)
             return;
         if (std::abs(desired_steering) >= 0.98 * kSteeringStopRad ||
             std::abs(desired_steering) > kMaxLearnSteer)
@@ -512,6 +559,291 @@ private:
         }
     }
 
+    // SPEED LOOP (rewritten 2026-10-07).
+    //
+    // The old loop was, in effect, a pure integrator: every 15 ms it added
+    // kp*error*0.0047/V to the throttle (the kd term works out to ~0.003*
+    // error -- nothing), i.e. ~0.1 throttle per second at a 0.2 m/s error,
+    // bounded only by the 0.3 clip.  Throttle could therefore neither rise
+    // nor FALL quickly: it wound up whenever the wheels were held (rug edge,
+    // glass, a bump) and launched the car when they came free, overshot on
+    // every start, and when the setpoint ramp or the obstacle-clearance cap
+    // asked it to slow down it kept driving for ~1 s -- into the wall
+    // (2026-10-07, twice in one day after the round-14 guards).  Every guard
+    // added since (stall ceiling, overspeed cut, resume, breakaway hand-off)
+    // patched a symptom of that one structure.
+    //
+    // Now:  throttle = feed-forward(setpoint) + bounded trim + P term
+    //   * FEED-FORWARD cruise_pwm(): the throttle that holds a speed on the
+    //     flat, learned from steady driving (cruise_gain_).  The throttle
+    //     follows the setpoint ramp directly, so slowing the setpoint slows
+    //     the car at once.
+    //   * TRIM: a small integrator (+-kTrimMax) for floor/battery variation.
+    //     It only integrates while the wheels turn, so it cannot wind up.
+    //   * P term: soft when below target, firmer above (a gentle brake drag,
+    //     never more than kMaxBrakePwm reverse -- no wheel-locking jolt).
+    //   * BREAKAWAY: from rest, throttle starts just below the learned
+    //     breakaway value and climbs at kBoostRate until the wheels turn; on
+    //     the first moving tick it drops straight to feed-forward.  Pinned at
+    //     kStallPwmCeiling for kStallCutSeconds = BLOCKED (latched, published
+    //     on /qcar2/drive_stalled for the bump guard).
+    //   * HARD CEILING ON THE COMMAND ITSELF.  Every speed limit upstream
+    //     (explorer 0.20 m/s, MPPI 0.45) only limited the REQUEST; the old
+    //     loop could still WRITE up to 0.3 throttle and only noticed the
+    //     speed afterwards.  Now the throttle written to the motor can never
+    //     exceed cruise_pwm(target) + kTrimMax (+ kPwmHeadroom), never
+    //     kPwmMax, and never kStallPwmCeiling while starting -- a fast
+    //     command is not produced in the first place.
+    //   * Backup only: measured speed above target + kOverspeedMargin
+    //     (a sudden floor change) drops to a brake drag.
+    //   * TRACTION: wheel speed rising faster than kMaxWheelAccel is spin;
+    //     throttle is cut back that tick and trim pulled down.
+    // Returns the signed throttle.
+    double drive_throttle(double dt, double measured_speed)
+    {
+        const double direction = (setpoint_ > 0.0) ? 1.0 : -1.0;
+        const double target = std::abs(setpoint_);
+        const double speed = std::abs(measured_speed);
+        const bool same_direction = (measured_speed * setpoint_) > 0.0;
+        // Motion from the raw encoder as well as the filtered channel: the
+        // filtered one lags, and every tick of lag at breakaway throttle is
+        // a tick of throttle the rolling car does not need.
+        const bool encoder_moving = encoder_speed_ >= kStallSpeed &&
+                                    travel_direction_ * setpoint_ > 0.0;
+        const bool moving = speed >= kStallSpeed || encoder_moving;
+        const bool moving_our_way = (moving && same_direction) || encoder_moving;
+
+        if (dt > 0.0)
+        {
+            const double accel = (speed - std::abs(previous_measured_speed_)) / dt;
+            wheel_accel_ += 0.3 * (accel - wheel_accel_);           // the speed channel is noisy
+        }
+        previous_measured_speed_ = measured_speed;
+
+        // A reverse command (Nav2's BackUp, or the planner choosing reverse)
+        // is exactly how the car gets off what it hit: release the latch.
+        if (stall_latched_ && direction != stall_direction_)
+            set_stall_latched(false);
+
+        const double ff = cruise_pwm(target);
+        double throttle;                     // magnitude in the commanded direction
+        if (!moving_our_way)
+        {
+            // At rest (or still rolling the other way after a reversal):
+            // breakaway boost, no trim.
+            if (was_moving_ || boost_ == 0.0)
+                boost_ = std::max(ff, kStartFraction * breakaway_pwm_);
+            boost_ = std::min(boost_ + kBoostRate * dt, kStallPwmCeiling);
+            throttle = std::max(boost_, ff);
+            trim_ = 0.0;
+
+            if (!moving && throttle >= kStallPwmCeiling - 1e-6)
+            {
+                stall_pinned_seconds_ += dt;
+                if (!stall_latched_ && stall_pinned_seconds_ >= kStallCutSeconds)
+                {
+                    stall_direction_ = direction;
+                    set_stall_latched(true);
+                    RCLCPP_WARN(this->get_logger(),
+                        "Drive BLOCKED: %.2f throttle for %.1f s with the wheels not turning "
+                        "-- throttle cut until the command reverses or stops.",
+                        throttle, stall_pinned_seconds_);
+                }
+            }
+            else
+            {
+                stall_pinned_seconds_ = 0.0;
+            }
+            was_moving_ = false;
+        }
+        else
+        {
+            if (!was_moving_ && boost_ > 0.0)
+            {
+                breakaway_pwm_ = std::clamp(0.5 * breakaway_pwm_ + 0.5 * boost_,
+                                            kBreakawayPwm, kStallPwmCeiling);
+            }
+            boost_ = 0.0;
+            was_moving_ = true;
+            stall_pinned_seconds_ = 0.0;
+
+            const double error = target - speed;
+            const bool spinning = wheel_accel_ > kMaxWheelAccel;
+            if (!spinning)
+                trim_ = std::clamp(trim_ + kTrimKi * error * dt, -kTrimMax, kTrimMax);
+            else
+                trim_ = std::max(trim_ - kTractionTrimCut, -kTrimMax);
+            const double p = (error >= 0.0) ? kTrimKpUp * error : kTrimKpDown * error;
+            throttle = ff + trim_ + p;
+            if (spinning)
+                throttle *= 0.85;
+
+            // Learn the feed-forward from steady driving near the target --
+            // never from pushing something (speed far below target).
+            if (speed > 0.06 && std::abs(error) < 0.08 && std::abs(wheel_accel_) < 0.15 &&
+                throttle > kBreakawayPwm)
+            {
+                const double gain = std::clamp((throttle - kBreakawayPwm) / speed,
+                                               kCruiseGainMin, kCruiseGainMax);
+                cruise_gain_ += kCruiseLearnRate * (gain - cruise_gain_);
+            }
+
+            // HARD OVERSPEED: whatever the loop thinks, the wheels are too fast.
+            if (speed > target + kOverspeedMargin)
+            {
+                throttle = std::min(throttle, 0.0);
+                trim_ = std::min(trim_, 0.0);
+                if (!overspeed_)
+                    RCLCPP_WARN(this->get_logger(),
+                        "OVERSPEED: wheels %.2f m/s, target %.2f -- drive throttle cut.", speed, target);
+                overspeed_ = true;
+            }
+            else
+            {
+                overspeed_ = false;
+            }
+        }
+
+        // HARD THROTTLE CEILING tied to the requested speed, and the brake floor.
+        throttle = std::clamp(throttle, -kMaxBrakePwm, std::min(kPwmMax, ff + kTrimMax + kPwmHeadroom));
+        ff_log_ = ff;
+        return direction * throttle;
+    }
+
+    // Throttle that holds `speed` (m/s) on the flat, from the learned gain.
+    double cruise_pwm(double speed) const
+    {
+        return std::clamp(kBreakawayPwm + cruise_gain_ * speed, kBreakawayPwm, kStallPwmCeiling);
+    }
+
+    // One CSV row per control tick: ~/.ros/qcar2_speed_logs/speed_<time>.csv.
+    // Without this the controller's behaviour cannot be reconstructed after a
+    // run (the 2026-10-07 crash left no evidence at all).
+    void log_speed(const rclcpp::Time & now, double target, double measured_speed)
+    {
+        if (!speed_log_.is_open())
+        {
+            if (speed_log_failed_)
+                return;
+            const char * home = std::getenv("HOME");
+            const std::string dir = std::string(home ? home : "/tmp") + "/.ros/qcar2_speed_logs";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            const std::time_t t = std::time(nullptr);
+            char stamp[32];
+            std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&t));
+            const std::string path = dir + "/speed_" + stamp + ".csv";
+            speed_log_.open(path);
+            if (!speed_log_.is_open())
+            {
+                speed_log_failed_ = true;
+                RCLCPP_WARN(this->get_logger(), "Cannot write speed log %s", path.c_str());
+                return;
+            }
+            RCLCPP_INFO(this->get_logger(), "Speed log: %s", path.c_str());
+            speed_log_ << "t,desired,target,setpoint,measured,throttle,ff,trim,boost,cruise_gain,"
+                          "breakaway,clear_front,clear_rear,stalled,estop,battery\n";
+        }
+        speed_log_ << std::fixed << std::setprecision(4)
+                   << now.seconds() << ',' << desired_speed << ',' << target << ',' << setpoint_ << ','
+                   << measured_speed << ',' << motor_speed_cmd << ',' << ff_log_ << ',' << trim_ << ','
+                   << boost_ << ',' << cruise_gain_ << ',' << breakaway_pwm_ << ','
+                   << clearance_front_.load() << ',' << clearance_rear_.load() << ','
+                   << stall_latched_ << ',' << estop_engaged_.load() << ',' << battery_voltage << '\n';
+        if ((now - last_log_flush_).seconds() > 1.0)
+        {
+            speed_log_.flush();
+            last_log_flush_ = now;
+        }
+    }
+
+    void set_stall_latched(bool latched)
+    {
+        stall_latched_ = latched;
+        stall_pinned_seconds_ = 0.0;
+        if (latched)
+            motor_speed_cmd = 0.0;
+        last_stall_publish_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);   // publish now
+    }
+
+    void publish_stall_state(const rclcpp::Time & now)
+    {
+        if ((now - last_stall_publish_).seconds() < 0.2)
+            return;
+        last_stall_publish_ = now;
+        std_msgs::msg::Bool msg;
+        msg.data = stall_latched_;
+        stall_publisher_->publish(msg);
+    }
+
+    // SMOOTH SPEED SETPOINT.  Every source (Nav2 through the converter, the
+    // console drive pad, the converter's watchdog zeros) used to set the
+    // target speed directly, so every stop was a step to zero throttle and
+    // every start a step up.  On this floor's slippery tiles those steps broke
+    // traction -- the wheels spun on take-off and skidded on stops -- and
+    // each slip went straight into the wheel odometry that Cartographer uses
+    // as its motion guess, which smeared the map.  The momentary watchdog
+    // zeros (MPPI running late) were also felt as stutters.
+    //
+    // Now the loop tracks setpoint_, which follows the command at no more
+    // than kSetpointAccel / kSetpointDecel.  At the 0.20 m/s mapping speed a
+    // full stop takes ~0.3 s and ~3 cm.  Only the EMERGENCY STOP bypasses the
+    // ramp.
+    //
+    // OBSTACLE CLEARANCE.  qcar2_bump_guard.py publishes how far the car can
+    // go, along the arc it is steering, before its front / rear bumper meets
+    // anything the LiDAR or the RealSense depth can see.  The allowed speed
+    // toward it is kClearanceGain * (clearance - kClearanceMargin), so the
+    // car eases down as it approaches and comes to rest kClearanceMargin
+    // short, instead of driving on until something has to stop it hard.
+    // Applied here because every drive source passes through this node:
+    // the console's manual drive pad included.  A stale message (guard not
+    // running) is ignored.
+    double target_speed(const rclcpp::Time & now) const
+    {
+        double target = desired_speed;
+        if ((now.nanoseconds() - clearance_stamp_ns_.load()) * 1e-9 <= kClearanceTimeout)
+        {
+            const double front = std::max(0.0, kClearanceGain * (clearance_front_ - kClearanceMargin));
+            const double rear = std::max(0.0, kClearanceGain * (clearance_rear_ - kClearanceMargin));
+            target = std::clamp(target, -rear, front);
+            // The cap shrinks in proportion to the room left, so it would
+            // approach the margin forever at an ever-slower creep that the
+            // motor deadband cannot hold anyway: finish the stop instead.
+            if (std::abs(target) < kSetpointStopSpeed)
+                target = 0.0;
+        }
+        return target;
+    }
+
+    void update_setpoint(const rclcpp::Time & now, double dt)
+    {
+        if (estop_engaged_)
+        {
+            setpoint_ = 0.0;                 // the one hard stop
+            return;
+        }
+        const double target = target_speed(now);
+        double next;
+        if (target == 0.0 || target * setpoint_ < 0.0 || std::abs(target) < std::abs(setpoint_))
+        {
+            // Slowing down (or through zero to reverse): toward target, but
+            // never past zero in one go.
+            const double goal = (target * setpoint_ < 0.0) ? 0.0 : target;
+            const double step = kSetpointDecel * dt;
+            next = setpoint_ + std::clamp(goal - setpoint_, -step, step);
+        }
+        else
+        {
+            const double step = kSetpointAccel * dt;
+            next = setpoint_ + std::clamp(target - setpoint_, -step, step);
+        }
+        // Finish a stop cleanly rather than creeping in the deadband.
+        if (target == 0.0 && std::abs(next) < kSetpointStopSpeed)
+            next = 0.0;
+        setpoint_ = next;
+    }
+
     void speed_controller()
     {
         // Once the stop has been issued the card must not be written again,
@@ -523,96 +855,61 @@ private:
         auto start_time = clock_.now();
         // time delta calculation
         rclcpp::Duration delta_time = start_time-end_time_;
-        double measured_speed = 0;
-        // method used for constructing a PD speed controller for QCar2
-        //Convert desired linear speed to desired motor speed
+        const double dt = std::clamp(delta_time.seconds(), 0.0, 0.1);
+        update_setpoint(start_time, dt);
 
-        if (desired_speed != 0)
+        // Neither speed source carries the direction of travel: channel
+        // 14000 ("Motor Speed") is a filtered magnitude, and the encoder
+        // count reads positive in reverse too -- see update_encoder_speed().
+        // Magnitude comes from the encoder (lightly smoothed; 14000's lag
+        // let the loop keep pushing after the car was already at speed --
+        // offline sim worst-case peak 0.34 vs 0.24 m/s for a 0.20 target),
+        // with 14000 as a fallback should the encoder ever read dead while
+        // the car is clearly moving.  The sign is update_travel_direction()'s.
+        // Measured every tick so both stay continuous through stops.
+        update_encoder_speed(delta_time.seconds());
+        const double channel_magnitude =
+            std::abs((joint_speed_measured/(720.0*4.0))*((13.0*19.0)/(70.0*30.0))*(2.0*M_PI)*0.033);
+        encoder_speed_filtered_ += 0.5 * (encoder_speed_ - encoder_speed_filtered_);
+        const double speed_magnitude =
+            (channel_magnitude > 0.10 && encoder_speed_filtered_ < 0.02)
+                ? channel_magnitude : encoder_speed_filtered_;
+        update_travel_direction(speed_magnitude);
+        const double measured_speed = speed_magnitude * travel_direction_;
+        travel_direction_shared_.store(travel_direction_);
+
+        if (setpoint_ != 0)
         {
-            // RESUME after a momentary zero.  This loop builds throttle up
-            // gradually (the integrator below), and at a Nav2 cruise of
-            // ~0.1 m/s it takes about a second of UNBROKEN commands to reach
-            // the throttle that breaks the wheels' static friction.  But any
-            // single zero command used to drop motor_speed_cmd straight back
-            // to 0 (the else-branch), and zeros arrive constantly while the
-            // controller runs late: nav2_qcar_command_convert.cpp's watchdog
-            // sends one whenever /cmd_vel_nav is quiet for its timeout.  The
-            // integrator was reset every few hundred milliseconds, never got
-            // there, and the car sat still while being "commanded to move" --
-            // the console's MOTOR NOT RESPONDING banner and the controller's
-            // repeated "Failed to make progress" (38 in one auto-mapping run).
-            //
-            // The stop itself stays instant (zero still means zero throttle,
-            // right now).  Only the RESTART changes: if motion resumes in the
-            // same direction within kResumeWindowSeconds, carry on from the
-            // throttle that had been reached instead of from nothing.
-            if (motor_speed_cmd == 0.0 && resume_pwm_ != 0.0 &&
-                (resume_pwm_ > 0.0) == (desired_speed > 0.0) &&
-                (start_time - zero_since_).seconds() < kResumeWindowSeconds)
-            {
-                motor_speed_cmd = resume_pwm_;
-            }
-            resume_pwm_ = 0.0;
-            // START AT THE DEADBAND EDGE.  Below ~0.03 throttle the motor does
-            // not turn at all (see the deadband note below), yet a fresh start
-            // used to climb there from 0 through the integrator: at a crawl
-            // (0.03-0.1 m/s, i.e. every careful move near an obstacle) that is
-            // 0.5-2 s of commanding motion with nothing happening, which is
-            // exactly the "why does it take so long to do anything" delay.
-            // Jumping straight to the edge costs nothing -- by definition that
-            // throttle barely moves the car -- and the loop takes it from there.
-            if (motor_speed_cmd == 0.0)
-            {
-                motor_speed_cmd = std::copysign(kBreakawayPwm, desired_speed);
-            }
-
-            // Channel 14000 ("Motor Speed") is a well-filtered MAGNITUDE and
-            // does not reliably carry the direction of travel.  That never
-            // mattered while this car was forward-only, but it makes reverse
-            // unusable: asking for -0.20 m/s while the feedback reads +0.20
-            // leaves speed_error stuck at -0.40 -- double the true error, and
-            // an error that closing the loop can never remove.  The PD
-            // integrator below therefore ramps motor_speed_cmd straight down
-            // to its -0.3 clip and parks there, so EVERY reverse manoeuvre ran
-            // at full reverse throttle no matter how slowly Nav2 asked for it.
-            // MPPI meanwhile modelled the -0.20 m/s it requested, so its yaw
-            // predictions were several times too small, the car swung wide of
-            // the planned curve, and no steering correction could catch up.
-            //
-            // The motor encoder count is a signed quadrature count, so it
-            // gives direction unambiguously.  Same rule as
-            // wheel_imu_odometry.py::_signed_speed(): magnitude from 14000,
-            // sign from the encoder.  If 14000 ever does carry a sign, this is
-            // a no-op rather than a second inversion.
-            measured_speed = std::abs((joint_speed_measured/(720.0*4.0))*((13.0*19.0)/(70.0*30.0))*(2.0*M_PI)*0.033)
-                             * travel_direction(delta_time.seconds());
+            command_is_zero_ = false;
             update_steering_bias(delta_time.seconds(), measured_speed);
-            speed_error = desired_speed-measured_speed;
-            motor_speed_cmd = motor_speed_cmd+ (speed_error*kp+((speed_error-prior_speed_error)/delta_time.seconds())*kd)*0.0047/battery_voltage;
-            prior_speed_error = speed_error;
-
-            // clip pwm command to not exceed 0.3
-            if (motor_speed_cmd>0.3)
-                motor_speed_cmd =0.3;
-
-            // check for motor deadband at PWM ~|0.03|
-            if (motor_speed_cmd<0.01 && motor_speed_cmd >=0 && desired_speed > 0)
-                motor_speed_cmd =0.01+motor_speed_cmd;
-            if (motor_speed_cmd<0.0 && motor_speed_cmd >=-0.01&& desired_speed < 0)
-                motor_speed_cmd =-0.01+motor_speed_cmd;
-
-            if (motor_speed_cmd<-0.3)
-                motor_speed_cmd = -0.3;
+            motor_speed_cmd = drive_throttle(dt, measured_speed);
         }
         else
         {
-            if (motor_speed_cmd != 0.0)
-            {
-                resume_pwm_ = motor_speed_cmd;      // remembered for a quick resume
-                zero_since_ = start_time;
-            }
             motor_speed_cmd = 0;
+            was_moving_ = false;
+            boost_ = 0.0;
+            trim_ = 0.0;
+            overspeed_ = false;
+            stall_pinned_seconds_ = 0.0;
+            previous_measured_speed_ = 0.0;
+            wheel_accel_ = 0.0;
+            if (!command_is_zero_)
+            {
+                command_is_zero_ = true;
+                command_zero_since_ = start_time;
+            }
+            // A deliberate pause (not the converter's momentary watchdog
+            // zeros) is a new intent: allow driving in the blocked direction
+            // again.
+            if (stall_latched_ &&
+                (start_time - command_zero_since_).seconds() > kStallReleaseZeroSeconds)
+                set_stall_latched(false);
         }
+        if (stall_latched_)
+            motor_speed_cmd = 0.0;
+        publish_stall_state(start_time);
+        log_speed(start_time, target_speed(start_time), measured_speed);
 
         // motor channel mapping
         std::map<std::string, int> motor_channel_map {{"steering_angle", 1000},
@@ -761,7 +1058,10 @@ private:
         joint_state.position.clear();
         joint_state.position.push_back(ENBuffer[0]);
         joint_state.velocity.clear();
-        joint_state.velocity.push_back(OIBuffer[7]);
+        // SIGNED: channel 14000's magnitude with the direction the motor is
+        // being driven in (update_travel_direction()) -- neither 14000 nor
+        // the encoder count carries the sign by itself.
+        joint_state.velocity.push_back(std::abs(OIBuffer[7]) * travel_direction_shared_.load());
         joint_speed_measured = OIBuffer[7];
         // Signed quadrature count; the speed controller reads it to recover
         // the direction of travel that channel 14000 above cannot supply.
@@ -971,6 +1271,12 @@ private:
     t_int32 previous_encoder_count_{0};
     bool have_encoder_count_{false};
     double travel_direction_{1.0};
+    // Copy for timer_callback()'s /qcar2_joint publish (another thread).
+    std::atomic<double> travel_direction_shared_{1.0};
+    // Raw, unfiltered speed MAGNITUDE from the encoder count over one control
+    // tick -- detects the wheels starting to turn without channel 14000's lag.
+    double encoder_speed_{0.0};
+    double encoder_speed_filtered_{0.0};
 
     // Steering centre-bias learner/persistence -- see load_steering_bias(),
     // update_steering_bias() above.
@@ -995,14 +1301,75 @@ private:
     double desired_steering = 0;
     double prior_speed_error =0;
     double motor_speed_cmd = 0;
-    // Throttle the PD integrator had built up when the last zero command
-    // arrived, and when -- see the "resume" block in speed_controller().
-    double resume_pwm_ = 0.0;
-    rclcpp::Time zero_since_{0, 0, RCL_SYSTEM_TIME};
-    static constexpr double kResumeWindowSeconds = 0.5;
     // Throttle below which the motor does not turn (the "~|0.03|" deadband
-    // noted in speed_controller()); fresh starts begin here, not at 0.
+    // noted in speed_controller()); the floor for every start.
     static constexpr double kBreakawayPwm = 0.03;
+    // SPEED LOOP -- see drive_throttle().
+    // breakaway_pwm_: throttle at which the wheels last broke free from rest.
+    // cruise_gain_: extra throttle (above kBreakawayPwm) per m/s while
+    // cruising steadily.  The defaults are deliberately low guesses (0.2 m/s
+    // ~ 0.07 throttle); both are re-learned within seconds of driving.
+    double breakaway_pwm_ = 0.05;
+    double cruise_gain_ = 0.20;
+    double boost_ = 0.0;                  // breakaway throttle while at rest
+    double trim_ = 0.0;                   // bounded feed-forward correction
+    bool was_moving_ = false;
+    bool overspeed_ = false;
+    double ff_log_ = 0.0;
+    static constexpr double kStartFraction = 0.8;             // fresh start just below breakaway
+    static constexpr double kBoostRate = 0.08;                // throttle/s climb while the wheels are held
+    static constexpr double kCruiseGainMin = 0.05;
+    static constexpr double kCruiseGainMax = 0.5;
+    static constexpr double kCruiseLearnRate = 0.01;          // per 15 ms tick (~1.5 s time constant)
+    static constexpr double kTrimMax = 0.03;                  // trim authority, throttle
+    static constexpr double kTrimKi = 0.15;                   // throttle per (m/s * s)
+    static constexpr double kTrimKpUp = 0.10;                 // throttle per m/s below target
+    static constexpr double kTrimKpDown = 0.30;               // throttle per m/s above target (brake drag)
+    static constexpr double kTractionTrimCut = 0.005;         // per spinning tick
+    // HARD THROTTLE CEILING while rolling: cruise_pwm(target) + kTrimMax +
+    // kPwmHeadroom, never above kPwmMax.  At the 0.20 m/s mapping speed and
+    // the default gain that is 0.10 throttle -- ~0.35 m/s on the flat even if
+    // everything else in the loop were wrong.  This is what makes a surge
+    // impossible rather than detected.
+    static constexpr double kPwmHeadroom = 0.0;
+    static constexpr double kPwmMax = 0.12;                   // absolute, any speed
+    static constexpr double kStallSpeed = 0.03;               // m/s: below this the wheels are "not turning"
+    // Max throttle while the wheels are held -- above what breaks static
+    // friction on this floor (~0.06-0.09) but no more.  Was 0.15.
+    static constexpr double kStallPwmCeiling = 0.10;
+    static constexpr double kStallCutSeconds = 1.5;           // pinned that long = blocked
+    static constexpr double kStallReleaseZeroSeconds = 1.0;   // a real stop, not watchdog zeros
+    static constexpr double kOverspeedMargin = 0.08;          // m/s: backup cut only, see drive_throttle()
+    bool stall_latched_ = false;
+    double stall_direction_ = 1.0;
+    double stall_pinned_seconds_ = 0.0;
+    bool command_is_zero_ = true;
+    rclcpp::Time command_zero_since_{0, 0, RCL_SYSTEM_TIME};
+    rclcpp::Time last_stall_publish_{0, 0, RCL_SYSTEM_TIME};
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr stall_publisher_;
+    static constexpr double kMaxWheelAccel = 1.2;             // m/s^2: faster = tyres spinning
+    static constexpr double kMaxBrakePwm = 0.08;              // gentle drag only, no reverse jolt
+    double previous_measured_speed_ = 0.0;
+    double wheel_accel_ = 0.0;
+    // Per-tick CSV -- see log_speed().
+    std::ofstream speed_log_;
+    bool speed_log_failed_ = false;
+    rclcpp::Time last_log_flush_{0, 0, RCL_SYSTEM_TIME};
+
+    // Smooth setpoint + obstacle clearance -- see update_setpoint().
+    static constexpr double kSetpointAccel = 0.40;            // m/s^2
+    static constexpr double kSetpointDecel = 0.70;            // m/s^2
+    static constexpr double kSetpointStopSpeed = 0.02;        // m/s: below this a stop is finished
+    static constexpr double kClearanceGain = 1.2;             // 1/s: allowed speed per metre of room
+    static constexpr double kClearanceMargin = 0.08;          // m: comes to rest this far short
+    static constexpr double kClearanceTimeout = 0.5;          // s: older = guard not running
+    double setpoint_ = 0.0;
+    std::atomic<bool> estop_engaged_{false};
+    std::atomic<double> clearance_front_{100.0};
+    std::atomic<double> clearance_rear_{100.0};
+    std::atomic<int64_t> clearance_stamp_ns_{0};
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_subscriber_;
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr clearance_subscriber_;
     // Set once the shutdown stop has been written; blocks any further motor
     // writes so the zero cannot be overwritten during teardown.
     std::atomic<bool> motors_stopped_{false};

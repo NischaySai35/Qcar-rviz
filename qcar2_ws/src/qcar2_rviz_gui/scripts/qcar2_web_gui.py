@@ -47,8 +47,9 @@ from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy,
                        QoSHistoryPolicy, qos_profile_sensor_data)
 from rclpy.signals import SignalHandlerOptions
-from sensor_msgs.msg import BatteryState, Image, LaserScan
-from std_msgs.msg import Bool, Empty, Int32, String, UInt8MultiArray
+from sensor_msgs.msg import BatteryState, Image, LaserScan, PointCloud2
+from sensor_msgs_py import point_cloud2
+from std_msgs.msg import Bool, Empty, Float32MultiArray, Int32, String, UInt8MultiArray
 from tf2_ros import Buffer, TransformListener
 
 PROJECT_DIR = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz')
@@ -116,10 +117,15 @@ def sample_grid(grid, x, y):
     return None if v == 255 else v
 
 
-def write_map_files(grid, base):
+def write_map_files(grid, base, walls=()):
     """Save a grid_payload()'d /map as <base>.pgm + <base>.yaml, exactly as
     nav2's map_saver_cli does in its default trinary mode (same thresholds,
     same pixel values, same YAML keys), so navigation loads it unchanged.
+
+    `walls` are extra map-frame (x, y) points written as occupied: the
+    obstacles the car bumped into that the LiDAR never saw (glass, see
+    qcar2_bump_guard.py). Cartographer maps glass as free floor, so without
+    this a saved map sends navigation straight back into the same pane.
 
     Done here, from the copy this node already holds, because it is instant.
     Running map_saver_cli means starting a fresh ROS node and waiting for DDS
@@ -129,6 +135,11 @@ def write_map_files(grid, base):
     w, h = grid['w'], grid['h']
     cells = np.frombuffer(grid['data'], dtype=np.uint8).reshape(h, w).astype(np.int16)
     cells[cells == 255] = -1                           # unknown
+    for x, y in walls:
+        ix = int((x - grid['ox']) / grid['res'])
+        iy = int((y - grid['oy']) / grid['res'])
+        if 0 <= ix < w and 0 <= iy < h:
+            cells[iy, ix] = 100
     img = np.full((h, w), 205, dtype=np.uint8)         # map_saver: unknown
     img[(cells >= 0) & (cells <= 25)] = 254            # <= free_thresh 0.25
     img[cells >= 65] = 0                               # >= occupied_thresh 0.65
@@ -203,6 +214,8 @@ class State:
         self.voice = {'enabled': False, 'source': 'car', 'status': 'off',
                       'partial': '', 'final': '', 'action': '', 'error': ''}
         self.explore = None
+        self.room = None         # qcar2_room_analyzer.py's latest verdict
+        self.hints = None        # qcar2_explore_vlm.py's notes / closures / report
         self.detection_jpeg = (None, 0)
 
 
@@ -248,7 +261,13 @@ class WebGuiNode(Node):
         self.create_subscription(Path, '/plan', self.on_plan, 10)
         # ---- telemetry
         self.create_subscription(BatteryState, '/qcar2_battery', self.on_battery, 1)
+        # Wheel odometry is /odom in navigation but /wheel_imu_odom in
+        # mapping (odometry.launch.py remaps it; mapping.launch.py does not).
+        # Listening to /odom alone left speed stuck at 0 while mapping, so
+        # any drive over 2.5 s raised a false MOTOR NOT RESPONDING.  Exactly
+        # one of the two is published in either mode.
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)
+        self.create_subscription(Odometry, '/wheel_imu_odom', self.on_odom, 10)
         self.create_subscription(MotorCommands, '/qcar2_motor_speed_cmd', self.on_motor_cmd, 10)
         self.create_subscription(Vector3, '/qcar2/steering_report', self.on_steering_report, 10)
         self.create_subscription(GoalStatusArray, '/navigate_to_pose/_action/status',
@@ -281,6 +300,23 @@ class WebGuiNode(Node):
         # so reflect the real topic rather than only this node's own copy --
         # otherwise the panel button would show OFF while the car is halted.
         self.create_subscription(Bool, '/qcar2_estop', self.on_estop_feedback, LATCHED)
+        # Obstacles the car physically hit but the LiDAR cannot see (glass) --
+        # see qcar2_bump_guard.py. Kept so a saved map includes them as walls.
+        self.bump_points = []
+        self.drive_blocked = False
+        self.create_subscription(PointCloud2, '/qcar2/bump_obstacles', self.on_bumps, LATCHED)
+        self.create_subscription(Bool, '/qcar2/drive_blocked', self.on_drive_blocked, LATCHED)
+        # Why the car is holding still -- see check_warnings().
+        self.clearance, self.clearance_at = (99.0, 99.0), 0.0
+        self.drive_stalled = False
+        self.create_subscription(Float32MultiArray, '/qcar2/obstacle_clearance',
+                                 self.on_clearance, 10)
+        self.create_subscription(Bool, '/qcar2/drive_stalled', self.on_drive_stalled, LATCHED)
+        # Room awareness for auto-explore: the analyzer's outline/coverage
+        # and the vision model's notes, report and closures (with undo).
+        self.create_subscription(String, '/qcar2/room_status', self.on_room_status, LATCHED)
+        self.create_subscription(String, '/qcar2/explore_hints', self.on_explore_hints, LATCHED)
+        self.hints_clear_pub = self.create_publisher(String, '/qcar2/explore_hints_clear', 10)
 
         # ---- commands out
         self.initialpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 1)
@@ -460,10 +496,37 @@ class WebGuiNode(Node):
         # Commanded to move but the wheels aren't responding: covers
         # e-stop, a sagging battery, and a broken cmd_vel_safe relay
         # alike without having to diagnose which one from here.
-        if abs(s.cmd_throttle) > 0.05 and abs(s.speed) < 0.02:
-            if self._stall_since is None:
+        if self.drive_blocked:
+            # Explains the stall below, so it replaces that banner.
+            warnings['bumped'] = (
+                'BUMPED INTO SOMETHING THE LIDAR CANNOT SEE (glass or a low '
+                'object) — throttle cut, marked as an obstacle, backing off.')
+            self._stall_since = None
+        elif abs(s.cmd_throttle) > 0.05 and abs(s.speed) < 0.02:
+            # Before calling it a motor fault, rule out the two DELIBERATE
+            # holds -- otherwise the banner cries "fault" every time the car
+            # correctly refuses to drive into something (2026-10-06 runs).
+            ahead = s.cmd_throttle > 0
+            room = None
+            if now - self.clearance_at < 0.5:
+                room = self.clearance[0 if ahead else 1]
+            if self.drive_stalled:
+                warnings['stalled'] = (
+                    'DRIVE BLOCKED — the wheels could not turn, so the throttle is cut. '
+                    'It frees itself by reversing or stopping.')
+                self._stall_since = None
+            elif room is not None and room < 0.12:
+                # Informational, not a fault: the obstacle slow-down at work.
+                warnings['holding'] = (
+                    f'HOLDING — obstacle {room * 100:.0f} cm '
+                    f'{"ahead" if ahead else "behind"}; the car will not drive '
+                    'into it. Waiting for a way around.')
+                self._stall_since = None
+            elif self._stall_since is None:
                 self._stall_since = now
-            elif now - self._stall_since > 1.5:
+            elif now - self._stall_since > 2.5:
+                # 2.5 s, not 1.5: the smooth throttle ramp on the slippery
+                # tiles legitimately takes a moment to get rolling.
                 warnings['motor_stall'] = (
                     'MOTOR NOT RESPONDING — commanded to move but the '
                     'wheels are not turning. Check the e-stop, the battery, '
@@ -686,13 +749,59 @@ class WebGuiNode(Node):
         self.ask_pub.publish(msg)
         return True
 
-    def on_detections(self, msg):
+    def on_bumps(self, msg):
+        pts = [(float(x), float(y)) for x, y, _z in
+               point_cloud2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)]
+        with self.state.lock:
+            self.bump_points = pts
+
+    def on_drive_blocked(self, msg):
+        self.drive_blocked = bool(msg.data)
+
+    def on_clearance(self, msg):
+        if len(msg.data) >= 2:
+            self.clearance = (float(msg.data[0]), float(msg.data[1]))
+            self.clearance_at = time.monotonic()
+
+    def on_drive_stalled(self, msg):
+        self.drive_stalled = bool(msg.data)
+
+    def on_room_status(self, msg):
         try:
             data = json.loads(msg.data)
         except ValueError:
             return
         with self.state.lock:
-            self.state.detections = data.get('cameras') or {}
+            self.state.room = data
+
+    def on_explore_hints(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        with self.state.lock:
+            self.state.hints = data
+
+    def clear_hints(self, what):
+        msg = String()
+        msg.data = what if what in ('glass', 'doorway', 'skips', 'all') else 'all'
+        self.hints_clear_pub.publish(msg)
+
+    def on_detections(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        cameras = data.get('cameras') or {}
+        # The detector's 'front' boxes are measured on the CSI bumper camera.
+        # When the front pane shows the RealSense instead (a different lens,
+        # field of view and mounting), those boxes would land on the wrong
+        # things, so they are not drawn there; the RealSense view carries its
+        # own distance readouts.
+        if self.front_topic != '/front/camera/csi_image':
+            cameras = {k: v for k, v in cameras.items() if k != 'front'}
+        with self.state.lock:
+            self.state.detections = cameras
             self.state.detections_at = time.monotonic()
 
     def on_answer(self, msg):
@@ -864,10 +973,11 @@ class WebGuiNode(Node):
         name = ''.join(ch for ch in name if ch.isalnum() or ch in '-_') or 'qcar_map'
         with self.state.lock:
             grid = self.state.map
+            walls = list(self.bump_points)
         if grid is None:
             return False, 'No map received yet -- nothing to save.'
         try:
-            write_map_files(grid, os.path.join(PROJECT_DIR, 'maps', name))
+            write_map_files(grid, os.path.join(PROJECT_DIR, 'maps', name), walls)
         except OSError as exc:
             return False, f'Could not write maps/{name}: {exc}'
         msg = String()
@@ -950,7 +1060,8 @@ class WebServer:
                     # detector cannot leave frozen boxes drawn on live video.
                     'detections': (s.detections if time.monotonic() -
                                    getattr(s, 'detections_at', 0.0) < 3.0 else {}),
-                    'voice_in': s.voice, 'explore': s.explore}
+                    'voice_in': s.voice, 'explore': s.explore,
+                    'room': s.room, 'hints': s.hints}
 
     async def websocket(self, request):
         ws = web.WebSocketResponse(heartbeat=10, max_msg_size=0)
@@ -1033,7 +1144,14 @@ class WebServer:
             # is not reentrant; nesting these deadlocked the whole event
             # loop on tick 0 the first time this was tried).
             if tick % 2 == 0:
-                small.insert(0, self.state_message())
+                state = self.state_message()
+                # The room analysis (outline + every gap) and the vision
+                # notes are ~10 KB and change every ~2 s: send them at 2 Hz,
+                # not with every 10 Hz state, so they cannot crowd the link.
+                if tick % 10 != 0:
+                    state.pop('room', None)
+                    state.pop('hints', None)
+                small.insert(0, state)
             for update in small:
                 await ws.send_json(update)
             for payload in grids:
@@ -1043,6 +1161,14 @@ class WebServer:
 
     async def toast(self, ws, text, kind='info'):
         await ws.send_json({'t': 'toast', 'msg': text, 'kind': kind})
+
+    async def ack(self, ws, cmd, **extra):
+        """Confirm a control command reached the car (the browser shows it),
+        so a click that got lost is noticed instead of silently ignored."""
+        try:
+            await ws.send_json({'t': 'ack', 'cmd': cmd, **extra})
+        except Exception:                    # noqa: BLE001 - socket closing
+            pass
 
     async def handle(self, ws, cmd):
         n, t = self.node, cmd.get('t')
@@ -1058,11 +1184,13 @@ class WebServer:
                 await self.toast(ws, 'Goal sent')
         elif t == 'cancel':
             n.cancel_goal()
+            await self.ack(ws, t)
         elif t == 'estop':
             n.set_estop(cmd.get('on', True))
+            await self.ack(ws, t, on=n.estop)
         elif t == 'stopall':
             n.stop_all()
-            await self.toast(ws, 'Shutting everything down', 'warn')
+            await self.ack(ws, t)
         elif t == 'speed_limit':
             n.set_speed_limit(cmd['pct'])
         elif t == 'steer_limit':
@@ -1083,6 +1211,10 @@ class WebServer:
                 await self.toast(ws, f'Going to the {cmd.get("name")}')
         elif t == 'explore':
             n.set_explore(cmd.get('on', True))
+            await self.ack(ws, t, on=bool(cmd.get('on', True)))
+        elif t == 'clear_hints':
+            n.clear_hints(str(cmd.get('what', 'all')))
+            await self.ack(ws, t)
             await self.toast(
                 ws, f'Exploration {"resumed" if cmd.get("on", True) else "paused"}')
         elif t == 'cams360':

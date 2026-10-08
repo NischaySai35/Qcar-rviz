@@ -328,8 +328,9 @@ The separator before `8080` is a **colon**, not a dot.
 mic access over HTTPS or localhost). In a terminal **on the laptop** (external
 cmd / PowerShell / Terminal), run this and leave it running:
 ```bash
-ssh -N -L 18080:127.0.0.1:8080 nvidia@10.104.187.236
+ssh -N -L 18080:127.0.0.1:8080 nvidia@10.164.58.236
 ```
+This ip address changes dynamically based on connected network, so check it in qcar
 Then open `http://localhost:18080` on the laptop. `18080` is the laptop-side
 port; the Orin-side console stays on port `8080`. `-N` means the window just
 sits there with no prompt — that is normal; closing it closes the tunnel.

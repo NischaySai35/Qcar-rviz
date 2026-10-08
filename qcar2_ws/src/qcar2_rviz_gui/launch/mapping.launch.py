@@ -14,7 +14,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
+                            LogInfo, OpaqueFunction, TimerAction)
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
@@ -93,8 +94,25 @@ def generate_launch_description():
             get_package_share_directory('qcar2_nodes'), 'config', 'qcar2_slam_and_nav.yaml'),
         description='Nav2 parameters used by explore mode (costmaps, planner, controller)')
     declare_time_budget_cmd = DeclareLaunchArgument(
-        'time_budget_sec', default_value='900.0',
+        'time_budget_sec', default_value='1800.0',
         description='Hard stop for autonomous exploration, seconds')
+    declare_go_next_room_cmd = DeclareLaunchArgument(
+        'go_next_room', default_value='false',
+        description='Auto-explore: also follow doorways into neighbouring rooms. '
+                    'Off by default -- only the room the car starts in is mapped.')
+    declare_use_llm_cmd = DeclareLaunchArgument(
+        'use_llm', default_value='true',
+        description='Auto-explore: run the vision model (Cosmos-Reason2) so the car '
+                    'can spot glass, doorways and gaps not worth visiting')
+    declare_llm_size_cmd = DeclareLaunchArgument(
+        'llm_size', default_value='auto',
+        description='Cosmos-Reason2 size for auto-explore: 2B (~1 s per look), 8B '
+                    '(~3-4 s, better judgement), or auto = 8B when fully downloaded')
+    declare_use_realsense_cmd = DeclareLaunchArgument(
+        'use_realsense', default_value='true',
+        description='Show the RealSense D435 on top as the console front view, '
+                    'with distances and fps drawn on it -- same as navigation. '
+                    'Object detection keeps using the four CSI cameras.')
 
     qcar2_gui_dir = get_package_share_directory('qcar2_rviz_gui')
     qcar2_nodes_dir = get_package_share_directory('qcar2_nodes')
@@ -104,7 +122,14 @@ def generate_launch_description():
             [os.path.join(qcar2_gui_dir, 'launch', 'hardware_base.launch.py')]),
         launch_arguments={
             'use_cameras': cameras_on,
-            'use_front_camera': use_front_camera,
+            # The CSI front-preview relay publishes /front/camera/preview,
+            # and so does qcar2_depth_view.py when the RealSense is the front
+            # view: two publishers on one topic, frames from both cameras
+            # interleaved. With the RealSense, the relay stays off (object
+            # detection reads the CSI camera's raw stream directly anyway).
+            'use_front_camera': PythonExpression([
+                "'true' if '", use_front_camera, "' == 'true' and '",
+                LaunchConfiguration('use_realsense'), "' != 'true' else 'false'"]),
         }.items(),
     )
 
@@ -182,6 +207,39 @@ def generate_launch_description():
         condition=IfCondition(use_drive_gui),
     )
 
+    # RealSense D435 as the console's front view, exactly as navigate.launch.py
+    # runs it (see the notes there): colour + aligned depth at 640x480/15 fps,
+    # and qcar2_depth_view.py drawing distances and the real fps on it.
+    use_realsense = LaunchConfiguration('use_realsense')
+    realsense_node = Node(
+        package='realsense2_camera', executable='realsense2_camera_node',
+        namespace='front', name='realsense', output='screen',
+        parameters=[{
+            'enable_color': True, 'enable_depth': True,
+            'enable_infra1': False, 'enable_infra2': False,
+            'enable_gyro': False, 'enable_accel': False,
+            'align_depth.enable': True, 'pointcloud.enable': False,
+            # Smaller than navigation's 640x480: in mapping the RealSense
+            # shares the CPU with four CSI cameras, YOLO-World and
+            # Cartographer, and the console showed it at only 2-4 fps.
+            # Aligning depth to colour is done on the CPU and scales with
+            # the pixel count; 640x360 colour + 480x270 depth is ~45% of
+            # the work and still plenty for the view, the vision model
+            # (which gets 448 px) and the depth obstacles (every 4th pixel).
+            'rgb_camera.profile': '640x360x15', 'depth_module.profile': '480x270x15',
+            'publish_tf': False,
+        }],
+        condition=IfCondition(use_realsense),
+    )
+    depth_view_node = Node(
+        package='qcar2_rviz_gui', executable='qcar2_depth_view.py',
+        name='qcar2_depth_view', output='screen',
+        condition=IfCondition(use_realsense),
+    )
+    front_topic = PythonExpression([
+        "'/front/camera/depth_view' if '", use_realsense,
+        "' == 'true' else '/front/camera/csi_image'"])
+
     # Browser console -- see scripts/qcar2_web_gui.py and web/index.html.
     # Needs no DISPLAY; open http://<car-ip>:<web_port> from any laptop.
     web_gui_node = Node(
@@ -199,6 +257,7 @@ def generate_launch_description():
         # motors, so the console must NOT publish its idle zeros straight to
         # /qcar2_motor_speed_cmd -- see drive_tick() in qcar2_web_gui.py.
         parameters=[{'mode': 'mapping', 'port': LaunchConfiguration('web_port'),
+                     'front_camera_topic': front_topic,
                      'cameras_owned': ParameterValue(cameras_on, value_type=bool),
                      'nav2_drives': ParameterValue(explore, value_type=bool),
                      'autosave_name': ParameterValue(
@@ -283,6 +342,81 @@ def generate_launch_description():
     )
     explorer_start = TimerAction(period=12.0, actions=[explorer_node])
 
+    # ROOM AWARENESS for auto-explore (see each script's docstring):
+    #   qcar2_room_analyzer.py -- outline, coverage %, which gaps matter, map
+    #                             quality, and the stop rule (geometry only);
+    #   qcar2_explore_vlm.py   -- looks through the cameras with the vision
+    #                             model: glass, doorways, gaps not worth it,
+    #                             and the final report.
+    go_next_room = ParameterValue(LaunchConfiguration('go_next_room'), value_type=bool)
+    room_analyzer_node = Node(
+        package='qcar2_rviz_gui', executable='qcar2_room_analyzer.py',
+        name='qcar2_room_analyzer', output='screen',
+        parameters=[{'go_next_room': go_next_room}],
+        condition=IfCondition(explore),
+    )
+    explore_vlm_node = Node(
+        package='qcar2_rviz_gui', executable='qcar2_explore_vlm.py',
+        name='qcar2_explore_vlm', output='screen',
+        parameters=[{'go_next_room': go_next_room}],
+        condition=IfCondition(explore),
+    )
+
+    # The vision model server, same as navigate.launch.py's (llama.cpp
+    # llama-server on 127.0.0.1:8090), started only for auto-explore.
+    # llm_size auto = the 8B model when its file is completely downloaded
+    # (better judgement on glass/doorways; ~3-4 s a look, which the car can
+    # afford because it stands still while looking), else the 2B.
+    def start_llm_server(context):
+        if LaunchConfiguration('explore').perform(context).lower() != 'true' or \
+                LaunchConfiguration('use_llm').perform(context).lower() != 'true':
+            return []
+        models = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz',
+                              'models', 'cosmos-reason2')
+        files = {'2B': ('Cosmos-Reason2-2B-Q8_0.gguf', 'mmproj-Cosmos-Reason2-2B-F16.gguf'),
+                 '8B': ('Cosmos-Reason2-8B-Q4_K_M.gguf', 'mmproj-Cosmos-Reason2-8B-F16.gguf')}
+        size = LaunchConfiguration('llm_size').perform(context).upper()
+        if size == 'AUTO':
+            model_8b = os.path.join(models, files['8B'][0])
+            # A partial download is a smaller file under the final name or a
+            # .part beside it; the complete Q4_K_M is ~5.0 GB.
+            complete = os.path.isfile(model_8b) and os.path.getsize(model_8b) > 4.9e9
+            size = '8B' if complete else '2B'
+        binary = os.path.join(os.path.expanduser('~'), 'llama.cpp', 'build', 'bin', 'llama-server')
+        model, mmproj = (os.path.join(models, f) for f in files.get(size, files['2B']))
+        missing = [p for p in (binary, model, mmproj) if not os.path.isfile(p)]
+        if missing:
+            return [LogInfo(msg=f'[llm] Not starting the vision model, missing: '
+                                f'{", ".join(missing)}. Exploring on geometry alone.')]
+        return [LogInfo(msg=f'[llm] Vision model for exploration: Cosmos-Reason2 {size}'),
+                ExecuteProcess(
+                    cmd=[binary, '-m', model, '--mmproj', mmproj,
+                         '-ngl', '99', '-c', '8192', '--host', '127.0.0.1', '--port', '8090'],
+                    name='llama_server', output='log')]
+
+    # Obstacle clearance for qcar2_hardware.cpp (the car eases to a stop 8 cm
+    # short of anything the LiDAR or depth camera sees, under Nav2 and the
+    # drive pad alike), plus the last resort when it touches something
+    # neither sensor sees (glass): freezes the odometry's translation so the
+    # map is not dragged, tells the explorer to give that goal up, and marks
+    # it on both costmaps' bump_layer -- see qcar2_bump_guard.py. Runs in
+    # manual mapping too, for the clearance.
+    bump_guard_node = Node(
+        package='qcar2_rviz_gui',
+        executable='qcar2_bump_guard.py',
+        name='qcar2_bump_guard',
+        output='screen',
+    )
+    # Low obstacles under the LiDAR plane, from the RealSense depth -- see
+    # qcar2_depth_obstacles.py.
+    depth_obstacles_node = Node(
+        package='qcar2_rviz_gui',
+        executable='qcar2_depth_obstacles.py',
+        name='qcar2_depth_obstacles',
+        output='screen',
+        condition=IfCondition(use_realsense),
+    )
+
     # Mapping ONLY maps. Voice commands, question answering ("is there a
     # cooler?") and "go to the sofa" live in navigate.launch.py, where a
     # finished, saved map with its objects is loaded and the car can act on
@@ -311,7 +445,14 @@ def generate_launch_description():
         declare_map_name_cmd,
         declare_nav_params_cmd,
         declare_time_budget_cmd,
+        declare_use_realsense_cmd,
+        declare_go_next_room_cmd,
+        declare_use_llm_cmd,
+        declare_llm_size_cmd,
+        OpaqueFunction(function=start_llm_server),
         hardware_launch,
+        realsense_node,
+        depth_view_node,
         wheel_imu_odometry_node,
         scan_only_cartographer_node,
         fused_cartographer_start,
@@ -324,4 +465,8 @@ def generate_launch_description():
         explore_navigation_launch,
         explore_converter_node,
         explorer_start,
+        bump_guard_node,
+        depth_obstacles_node,
+        room_analyzer_node,
+        explore_vlm_node,
     ])

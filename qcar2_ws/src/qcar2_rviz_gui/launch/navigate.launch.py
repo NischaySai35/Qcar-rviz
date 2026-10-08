@@ -85,7 +85,8 @@ def generate_launch_description():
                     'that the assistant uses for free-form questions and "what do you see"')
     declare_llm_size_cmd = DeclareLaunchArgument(
         'llm_size', default_value='2B',
-        description='Cosmos-Reason2 size: 2B (Q8, ~0.9 s per scene description) or 8B (Q4)')
+        description='Cosmos-Reason2 size: 2B (Q8, ~0.9 s per scene description), 8B (Q4, '
+                    'slower, better answers) or auto (8B once fully downloaded)')
 
     # Point bt_navigator at the Ackermann behavior tree.  The stock tree's
     # recovery RoundRobin contains <BackUp backup_dist="0.30">, which is what
@@ -184,6 +185,25 @@ def generate_launch_description():
             'autostart': True,
             'node_names': ['collision_monitor'],
         }],
+    )
+
+    # Obstacle clearance for qcar2_hardware.cpp (eases to a stop 8 cm short of
+    # anything seen), and hits on things no sensor sees (glass) become
+    # costmap obstacles -- see qcar2_bump_guard.py.
+    bump_guard_node = Node(
+        package='qcar2_rviz_gui',
+        executable='qcar2_bump_guard.py',
+        name='qcar2_bump_guard',
+        output='screen',
+    )
+    # Low obstacles under the LiDAR plane, from the RealSense depth -- see
+    # qcar2_depth_obstacles.py.
+    depth_obstacles_node = Node(
+        package='qcar2_rviz_gui',
+        executable='qcar2_depth_obstacles.py',
+        name='qcar2_depth_obstacles',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('use_realsense')),
     )
 
     # Draws the travel-direction arrows along the plan, the goal flag with its
@@ -346,9 +366,13 @@ def generate_launch_description():
         if LaunchConfiguration('use_llm').perform(context).lower() != 'true':
             return []
         size = LaunchConfiguration('llm_size').perform(context).upper()
-        quant = 'Q8_0' if size == '2B' else 'Q4_K_M'
         models = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz',
                               'models', 'cosmos-reason2')
+        if size == 'AUTO':
+            # 8B when its download is complete (~5.0 GB), else 2B.
+            big = os.path.join(models, 'Cosmos-Reason2-8B-Q4_K_M.gguf')
+            size = '8B' if os.path.isfile(big) and os.path.getsize(big) > 4.9e9 else '2B'
+        quant = 'Q8_0' if size == '2B' else 'Q4_K_M'
         binary = os.path.join(os.path.expanduser('~'), 'llama.cpp', 'build', 'bin', 'llama-server')
         model = os.path.join(models, f'Cosmos-Reason2-{size}-{quant}.gguf')
         mmproj = os.path.join(models, f'mmproj-Cosmos-Reason2-{size}-F16.gguf')
@@ -418,6 +442,8 @@ def generate_launch_description():
         collision_monitor_node,
         collision_monitor_lifecycle_manager,
         nav2_qcar2_converter,
+        bump_guard_node,
+        depth_obstacles_node,
         nav_visualizer_node,
         goal_reset_node,
         goal_heading_node,

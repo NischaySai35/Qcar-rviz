@@ -108,7 +108,7 @@ class Nav2QCarConverter : public rclcpp::Node
         });
     // Explicit "button is held" flag, set false the instant the operator
     // releases -- so handoff back to Nav2 is immediate on release rather
-    // than waiting out kManualCommandTimeout.  That timeout still exists
+    // than waiting out kManualReleaseTimeout.  That timeout still exists
     // underneath as a dead-man's switch for a dropped browser tab/socket.
     manual_active_subscriber_ = this->create_subscription<std_msgs::msg::Bool>(
         "/qcar2/manual_drive_active", rclcpp::QoS(1),
@@ -276,7 +276,7 @@ class Nav2QCarConverter : public rclcpp::Node
             // MANUAL OVERRIDE (web console arrow pad, usable in navigation
             // mode too, not just mapping).  Guarded by an explicit "active"
             // flag -- false the instant the operator releases the button --
-            // plus kManualCommandTimeout as a dead-man's switch in case the
+            // plus kManualHoldTimeout / kManualReleaseTimeout as a dead-man's switch in case the
             // browser tab or its WebSocket dies mid-hold.  While active,
             // this just substitutes the manual command for Nav2's for THIS
             // publish only: nav2_command_callback() keeps updating
@@ -287,10 +287,28 @@ class Nav2QCarConverter : public rclcpp::Node
             // wherever Nav2's plan currently wants to go -- not a stale
             // pre-override command -- which is what "release the button and
             // it carries on to the goal from wherever it ended up" needs.
-            bool manual_fresh = manual_active_ &&
-                (this->now() - last_manual_command_time_) <= kManualCommandTimeout;
-            if (manual_fresh) {
+            //
+            // ABSOLUTE AUTHORITY (2026-10-06).  The console repeats a held
+            // key every 150 ms, but over Wi-Fi / an SSH port-forward gaps of
+            // 300+ ms are routine.  The old rule dropped the override the
+            // moment one message was late, handing the wheels straight back
+            // to Nav2 -- which was still chasing its own goal -- until the
+            // next repeat: the car stuttered and "fought" the operator's
+            // keys.  Now, while the operator is driving:
+            //   * a late message keeps the LAST MANUAL command (never Nav2's)
+            //     for up to kManualHoldTimeout;
+            //   * beyond that (tab closed, link lost) the car STOPS -- the
+            //     dead-man's switch -- and only after kManualReleaseTimeout
+            //     does Nav2 get the wheels back;
+            //   * releasing the keys (active=false) hands back immediately.
+            // The explorer also stands down while the operator drives (see
+            // qcar2_explorer.py on_manual), so Nav2 has no goal to fight with.
+            const rclcpp::Duration manual_age = this->now() - last_manual_command_time_;
+            if (manual_active_ && manual_age <= kManualHoldTimeout) {
                 nav2_speed = manual_speed_;
+                nav2_steering = manual_steering_;
+            } else if (manual_active_ && manual_age <= kManualReleaseTimeout) {
+                nav2_speed = 0.0;            // operator's link went quiet: stop, don't hand back
                 nav2_steering = manual_steering_;
             } else {
                 manual_active_ = false;
@@ -458,7 +476,10 @@ class Nav2QCarConverter : public rclcpp::Node
         bool manual_active_ = false;
         rclcpp::Time last_manual_command_time_{0, 0, RCL_ROS_TIME};
         // 2x the GUI's 150 ms manual-drive heartbeat.
-        const rclcpp::Duration kManualCommandTimeout{std::chrono::milliseconds(300)};
+        // See ABSOLUTE AUTHORITY in command_plublish().  (Replaced the old
+        // single 300 ms kManualCommandTimeout.)
+        const rclcpp::Duration kManualHoldTimeout{std::chrono::milliseconds(700)};
+        const rclcpp::Duration kManualReleaseTimeout{std::chrono::milliseconds(2000)};
         bool have_odom_ = false;
         double measured_speed_ = 0.0;
         double measured_yaw_rate_ = 0.0;

@@ -329,7 +329,10 @@ controller_server:
         # than this to an obstacle's inscribed edge is charged at
         # critical_weight instead of the gentle repulsion -- the "a person
         # walked straight at the car, no choice but to react hard" case.
-        collision_margin_distance: 0.10
+        # 0.10 -> 0.08 (2026-10-08) with the local inflation_radius 0.45 ->
+        # 0.35: the smallest gap MPPI will drive through drops from ~45 cm to
+        # ~40 cm (car 24 cm wide + 8 cm each side).
+        collision_margin_distance: 0.08
         near_goal_distance: 0.5
       ConstraintCritic:
         enabled: true
@@ -477,7 +480,58 @@ local_costmap:
       height: 6
       resolution: 0.05
       footprint: "[[0.22, 0.12], [0.22, -0.12], [-0.21, -0.12], [-0.21, 0.12]]"
-      plugins: ["obstacle_layer", "inflation_layer"]
+      plugins: ["obstacle_layer", "depth_layer", "bump_layer", "inflation_layer"]
+      # Low obstacles under the LiDAR's 19 cm scan plane, from the RealSense
+      # depth (qcar2_depth_obstacles.py publishes them as a 1-degree "scan"
+      # in base_link). Its own layer: the LiDAR's clearing rays pass OVER a
+      # low object and would erase it if it shared obstacle_layer.
+      # raytrace_min_range 0.40: the D435 cannot see the first ~30 cm in
+      # front of the bumper, so clearing starts beyond that -- a low object
+      # the car has come close to stays marked instead of being "cleared" by
+      # a camera that simply cannot see it any more.
+      depth_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        footprint_clearing_enabled: False
+        observation_sources: depth
+        depth:
+          topic: /front/depth_scan
+          data_type: "LaserScan"
+          marking: True
+          clearing: True
+          inf_is_valid: true
+          min_obstacle_height: -1.0
+          max_obstacle_height: 2.0
+          obstacle_max_range: 2.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 2.4
+          raytrace_min_range: 0.40
+          observation_persistence: 0.0
+      # Obstacles the car PHYSICALLY ran into but the LiDAR cannot see: glass
+      # (the beam passes straight through), anything below the scan plane.
+      # qcar2_bump_guard.py detects the hit (wheels blocked, or wheels turning
+      # while the scan says the car is not moving) and publishes a short wall
+      # across the bumper in the map frame. A separate layer, marking only, so
+      # the LiDAR's clearing rays -- which go right through glass -- can never
+      # erase it. The guard re-publishes every 0.5 s, so a costmap clear in a
+      # recovery only removes it for that long.
+      bump_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        footprint_clearing_enabled: False
+        observation_sources: bumps
+        bumps:
+          topic: /qcar2/bump_obstacles
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+          # Range is measured from the cloud's frame origin (the map origin),
+          # not from the car, so it must cover the whole map.
+          obstacle_max_range: 1000.0
+          obstacle_min_range: 0.0
+          observation_persistence: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         # Lowered from 2.0 to match the global costmap's 1.5.  A higher
@@ -534,7 +588,14 @@ local_costmap:
         # now starts at 0.45 m from the LiDAR, so there is no penalty for
         # using space the operator has said is fine, and the planner's 0.9 m
         # global gradient still keeps paths down the middle when there is room.
-        inflation_radius: 0.45
+        #
+        # 0.45 -> 0.35 (2026-10-08): the car stood still at a gap between two
+        # people although the green path ran through it.  Two 0.45 m halos
+        # leave no zero-cost floor in any gap under ~0.9 m, so MPPI judged
+        # every rollout through it worse than waiting.  0.35 still covers the
+        # 0.25 m circumscribed radius plus 10 cm, and the 8 cm clearance stop
+        # in qcar2_hardware.cpp is unchanged.
+        inflation_radius: 0.35
       # A 2D LiDAR cannot fill a 3D voxel grid, so the VoxelLayer that used to
       # be here could mark a cell but never gather enough evidence to clear it
       # again -- that is what left a trail of "ghost" footprints behind moving
@@ -581,7 +642,45 @@ global_costmap:
       footprint: "[[0.22, 0.12], [0.22, -0.12], [-0.21, -0.12], [-0.21, 0.12]]"
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "depth_layer", "bump_layer", "inflation_layer"]
+      # See local_costmap.depth_layer: low obstacles from the RealSense, so
+      # the PLANNER routes around them too instead of only the controller.
+      depth_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        footprint_clearing_enabled: False
+        observation_sources: depth
+        depth:
+          topic: /front/depth_scan
+          data_type: "LaserScan"
+          marking: True
+          clearing: True
+          inf_is_valid: true
+          min_obstacle_height: -1.0
+          max_obstacle_height: 2.0
+          obstacle_max_range: 2.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 2.4
+          raytrace_min_range: 0.40
+          observation_persistence: 0.0
+      # See local_costmap.bump_layer: obstacles the car ran into that the
+      # LiDAR cannot see (glass). Without it here too, the planner keeps
+      # drawing the path straight through the glass it just hit.
+      bump_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        footprint_clearing_enabled: False
+        observation_sources: bumps
+        bumps:
+          topic: /qcar2/bump_obstacles
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+          obstacle_max_range: 1000.0
+          obstacle_min_range: 0.0
+          observation_persistence: 0.0
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -839,8 +938,14 @@ velocity_smoother:
     # steering rack itself covers full lock in 150 ms
     # (kMaxSteeringRateRadPerSec), so this was the binding constraint by a
     # factor of about seven.  4.0 rad/s^2 lets the rack be the limit instead.
-    max_accel: [1.1, 0.0, 4.0]
-    max_decel: [-1.5, 0.0, -4.0]
+    # Linear 1.1 / -1.5 -> 0.5 / -0.7 m/s^2 (2026-10-06): the floor tiles are
+    # slippery, and harder starts and stops spun or skidded the wheels, which
+    # corrupted the wheel odometry the map is built on and made every stop a
+    # jolt. qcar2_hardware.cpp ramps its own setpoint at 0.4 / 0.7 m/s^2 for
+    # every drive source; these match it so Nav2's commands already arrive
+    # smooth. At the 0.20 m/s mapping speed a stop takes ~0.3 s / ~3 cm.
+    max_accel: [0.5, 0.0, 4.0]
+    max_decel: [-0.7, 0.0, -4.0]
     odom_topic: "/odom"
     odom_duration: 0.1
     # Was [0,0,0]. At the very start of a move, FollowPath/MPPI's sampled

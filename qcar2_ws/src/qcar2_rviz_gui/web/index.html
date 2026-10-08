@@ -141,6 +141,11 @@
   #vResizeHandle:hover, #vResizeHandle.dragging { background: var(--accent-soft); }
   #vResizeHandle:hover::after, #vResizeHandle.dragging::after { background: var(--accent); }
   .panel-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+  /* Voice + Microphone side by side; they stack when the panel is too narrow
+     for two ~220 px columns, and Voice fills the row when Microphone is hidden
+     (mapping mode).  min-width: 0 lets long text wrap instead of overflowing. */
+  .card-pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; align-items: start; }
+  .card-pair > .card { min-width: 0; }
   .panel-scroll::-webkit-scrollbar { width: 9px; }
   .panel-scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 5px; }
   .card { background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: 12px; padding: 12px;
@@ -306,6 +311,7 @@
       <label><input type="checkbox" id="lyScan" checked><span class="swatch" style="background:#00e1ff"></span>LiDAR</label>
       <label class="navonly"><input type="checkbox" id="lyPlan" checked><span class="swatch" style="background:#00ff88"></span>Path</label>
       <label><input type="checkbox" id="lyObjects" checked><span class="swatch" style="background:#22d3ee"></span>Objects</label>
+      <label class="maponly"><input type="checkbox" id="lyRoom" checked><span class="swatch" style="background:#22c55e"></span>Room &amp; gaps</label>
     </div>
 
     <div class="hint" id="hint"></div>
@@ -343,8 +349,10 @@
           </div>
           <div class="slider-stack">
             <div class="ctrl" title="Drive speed">
-              <div class="ctrl-label"><span>Speed</span><b class="num" id="driveSpeedText">0.40</b></div>
-              <input type="range" id="driveSpeed" min="0.05" max="0.55" step="0.01" value="0.40">
+              <!-- 0.40 -> 0.25 default (2026-10-06): slower manual mapping
+                   gives cleaner walls and less wheel slip on the tiles. -->
+              <div class="ctrl-label"><span>Speed</span><b class="num" id="driveSpeedText">0.25</b></div>
+              <input type="range" id="driveSpeed" min="0.05" max="0.55" step="0.01" value="0.25">
             </div>
             <div class="ctrl" title="Steering angle">
               <div class="ctrl-label"><span>Steer</span><b class="num" id="driveSteerText">0.45</b></div>
@@ -386,6 +394,7 @@
       <!-- Microphone and Ask are navigation-only: mapping runs no voice or
            assistant node. Voice (the speaker) stays: mapping announces what
            it finds (see mapping.launch.py). -->
+      <div class="card-pair">
       <div class="card">
         <h3>Voice <span id="voiceState">off</span></h3>
         <button id="voiceBtn" style="width:100%">VOICE OFF</button>
@@ -419,6 +428,7 @@
           <div id="heardLog" class="muted micro">Nothing yet. Turn the mic on and speak.</div>
         </div>
       </div>
+      </div>
 
       <div class="card" id="objectsCard">
         <h3>Objects <span id="objState">—</span></h3>
@@ -443,6 +453,20 @@
         <h3>Auto explore <span id="exploreState">—</span></h3>
         <button id="exploreBtn" style="width:100%">PAUSE EXPLORING</button>
         <div id="exploreInfo" class="muted micro" style="margin-top:6px"></div>
+        <!-- Room awareness: qcar2_room_analyzer.py (geometry) + qcar2_explore_vlm.py (vision). -->
+        <div id="roomBox" style="display:none;margin-top:8px">
+          <div class="ctrl-label"><span>Room mapped</span><b class="num" id="roomPct">—</b></div>
+          <div style="height:6px;border-radius:3px;background:rgba(127,127,127,.25);overflow:hidden">
+            <div id="roomBar" style="height:100%;width:0;background:#22c55e;transition:width .6s"></div>
+          </div>
+          <div id="roomInfo" class="muted micro" style="margin-top:4px"></div>
+          <div id="roomReport" class="micro" style="margin-top:6px;display:none"></div>
+          <div id="roomNotes" class="muted micro" style="margin-top:6px;max-height:110px;overflow:auto"></div>
+          <div class="row" style="margin-top:6px;gap:6px">
+            <button id="undoGlass" class="micro" title="Remove the glass walls the vision model added">UNDO GLASS</button>
+            <button id="undoSkips" class="micro" title="Let the car visit the gaps the vision model skipped">UNDO SKIPS</button>
+          </div>
+        </div>
       </div>
 
       <div class="card maponly">
@@ -477,7 +501,7 @@ const S = {
   cx: 0, cy: 0, scale: 60, follow: true, fitted: false, tool: 'move', is3d: false,
   drag: null, press: null,
   layers: {map: null, gcost: null, lcost: null},
-  show: {map: true, gcost: true, lcost: true, scan: true, plan: true, objects: true},
+  show: {map: true, gcost: true, lcost: true, scan: true, plan: true, objects: true, room: true},
 };
 const $ = id => document.getElementById(id);
 const canvas = $('canvas'), ctx = canvas.getContext('2d');
@@ -485,9 +509,30 @@ const view = $('view');
 // The 3D module registers itself here; stays a no-op until it has loaded.
 const V3 = {ready: false};
 
+// Commands that must get through NOW. They used to share the telemetry socket
+// with the map, LiDAR and costmap stream; over a busy or forwarded link that
+// socket could be backed up or mid-reconnect, and send() then dropped the
+// click silently -- "I pressed E-STOP / stop exploring and nothing happened".
+// They now go on the small dedicated control socket (falling back to the
+// other one), the car acknowledges each one (onControlAck), and if neither
+// socket is open the operator is told the command was NOT sent.
+const CONTROL = new Set(['drive', 'estop', 'stopall', 'explore', 'cancel', 'clear_hints']);
 function send(obj) {
-  const socket = obj.t === 'drive' ? S.controlWs : S.ws;
-  if (socket && socket.readyState === 1) socket.send(JSON.stringify(obj));
+  const open = s => s && s.readyState === 1;
+  const primary = CONTROL.has(obj.t) ? S.controlWs : S.ws;
+  const backup = CONTROL.has(obj.t) ? S.ws : S.controlWs;
+  const socket = open(primary) ? primary : open(backup) ? backup : null;
+  if (socket) { socket.send(JSON.stringify(obj)); return true; }
+  if (obj.t !== 'drive' || obj.speed || obj.steering)
+    toast(`NOT CONNECTED — "${obj.t}" was not sent. Check the link to the car.`, 'error');
+  return false;
+}
+function onControlAck(m) {
+  const what = {estop: m.on ? 'EMERGENCY STOP engaged' : 'Emergency stop released',
+                stopall: 'Stopping everything…',
+                explore: m.on ? 'Exploring resumed' : 'Exploring paused',
+                cancel: 'Goal cancelled', clear_hints: 'Cleared'}[m.cmd];
+  if (what) toast(what, m.cmd === 'estop' && m.on ? 'error' : 'info');
 }
 function toast(msg, kind = 'info') {
   const el = document.createElement('div'); el.className = 'toast ' + kind; el.textContent = msg;
@@ -546,6 +591,7 @@ function connect() {
       case 'plan':  S.plan = m.pts; V3.setPlan && V3.setPlan(S.plan); break;
       case 'state': onState(m); break;
       case 'toast': toast(m.msg, m.kind); break;
+      case 'ack':   onControlAck(m); break;     // a control command sent on this socket
     }
   };
 }
@@ -553,6 +599,9 @@ function connectControl() {
   const ws = new WebSocket(`ws://${location.host}/control`);
   S.controlWs = ws;
   ws.onopen = () => send({t: 'drive', speed: 0, steering: 0});
+  ws.onmessage = ev => {
+    try { const m = JSON.parse(ev.data); if (m.t === 'ack') onControlAck(m); } catch (e) {}
+  };
   ws.onclose = () => { S.controlWs = null; setTimeout(connectControl, 500); };
 }
 
@@ -588,6 +637,7 @@ function onState(m) {
   applyEstop(m.estop); applyCams(m.cams360); applyVoice(m.voice);
   applyMic(m.mic); applyVoiceIn(m.voice_in);
   applyObjects(m.objects, m.object_stats); applyExplore(m.explore);
+  if ('room' in m) applyRoom(m.room, m.hints);       // sent at 2 Hz, not every state
   applyAnswers(m.answers); applyDetections(m.detections); applySaid(m.spoken);
   $('battery').textContent = m.battery == null ? '—' : m.battery.toFixed(1) + ' V';
   $('speed').textContent = Math.abs(m.speed).toFixed(2);
@@ -823,6 +873,73 @@ function applyExplore(e) {
     `${Math.round(e.elapsed)}s of ${Math.round(e.budget)}s</div>`;
 }
 
+// Room awareness panel: coverage from the geometry, notes and the final
+// report from the vision model. The map drawing itself is in drawRoom().
+function applyRoom(room, hints) {
+  S.room = room; S.hints = hints;
+  const box = $('roomBox');
+  if (!room || !S.explore) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  const pct = Math.round(100 * room.coverage);
+  $('roomPct').textContent = room.open ? `${pct}% (room not closed yet)` : `${pct}%`;
+  $('roomBar').style.width = pct + '%';
+  $('roomBar').style.background = pct >= 90 ? '#22c55e' : pct >= 80 ? '#84cc16' : '#f59e0b';
+  const fr = room.frontiers || [];
+  const n = s => fr.filter(f => f.status === s).length;
+  const q = room.quality == null ? '' :
+    ` · map ${room.quality_poor ? '<b style="color:#f59e0b">drifting — slowing down</b>' : 'consistent'}`;
+  $('roomInfo').innerHTML =
+    `${room.mapped_m2} m² seen of ~${(room.mapped_m2 + room.remaining_m2).toFixed(0)} m² · ` +
+    `${n('visit')} gaps to visit · ${n('ignore')} ignored · ${n('outside')} outside${q}` +
+    (room.view_coverage != null
+      ? `<br>Floor seen up close by the cameras: <b>${Math.round(100 * room.view_coverage)}%</b>` : '') +
+    (hints && hints.room_type ? `<br>Looks like: <b>${esc(hints.room_type)}</b>` : '') +
+    (hints && !hints.model ? '<br>Vision model not running — geometry only' : '') +
+    (room.go_next_room ? '<br>Following doorways into other rooms' : '');
+  const rep = hints && hints.report;
+  $('roomReport').style.display = rep ? '' : 'none';
+  if (rep) $('roomReport').innerHTML = `<b>${esc(rep.text)}</b>` +
+    (rep.reason ? `<div class="muted">Finished because: ${esc(rep.reason)}</div>` : '');
+  $('roomNotes').innerHTML = ((hints && hints.notes) || [])
+    .map(x => `<div>${esc(x.t)} · ${esc(x.text)}</div>`).join('');
+  const glass = ((hints && hints.all_closures) || []).filter(c => c.kind === 'glass').length;
+  $('undoGlass').disabled = !glass;
+  $('undoSkips').disabled = !(hints && hints.skip_regions && hints.skip_regions.length);
+}
+function drawRoom() {
+  const room = S.room, hints = S.hints;
+  if (!room) return;
+  ctx.save();
+  if (room.outline && room.outline.length > 2) {
+    ctx.strokeStyle = 'rgba(34,197,94,0.9)'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    room.outline.forEach(([x, y], i) => { const [sx, sy] = w2s(x, y); i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy); });
+    ctx.closePath(); ctx.stroke(); ctx.setLineDash([]);
+  }
+  const col = {visit: '#ff8c1a', ignore: 'rgba(160,160,160,0.7)', outside: '#d946ef'};
+  for (const f of room.frontiers || []) {
+    if (f.status === 'ignore' && f.reason === 'too small to matter') continue;
+    const [sx, sy] = w2s(f.x, f.y);
+    // Camera "seen up close" targets: a ring instead of a dot.
+    if (f.view) {
+      ctx.strokeStyle = '#ff8c1a'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(sx, sy, 6, 0, Math.PI * 2); ctx.stroke(); continue;
+    }
+    ctx.fillStyle = col[f.status] || '#aaa';
+    ctx.beginPath(); ctx.arc(sx, sy, f.status === 'visit' ? 5 : 3.5, 0, Math.PI * 2); ctx.fill();
+  }
+  // Solid red = glass confirmed by a bump (a real no-go wall); dashed =
+  // only suspected by the vision model, which does NOT block driving.
+  for (const c of (hints && hints.all_closures) || []) {
+    const [ax, ay] = w2s(c.x1, c.y1), [bx, by] = w2s(c.x2, c.y2);
+    ctx.strokeStyle = !c.apply ? 'rgba(255,170,60,0.8)' : c.kind === 'glass' ? '#ef4444' : '#d946ef';
+    ctx.lineWidth = c.apply ? 4 : 2; ctx.setLineDash(c.apply ? [] : [5, 5]);
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
 function applyVoice(v) {
   S.voice = v; $('voiceBtn').classList.toggle('active', v.on);
   $('voiceBtn').textContent = v.on ? 'VOICE ON' : 'VOICE OFF';
@@ -995,6 +1112,7 @@ function render() {
     ctx.fillStyle = '#00e1ff'; const r = Math.max(2, 0.05 * S.scale);
     for (let i = 0; i < S.scan.length; i += 2) { const [sx, sy] = w2s(S.scan[i], S.scan[i + 1]); ctx.fillRect(sx - r / 2, sy - r / 2, r, r); }
   }
+  if (S.room && S.show.room !== false) drawRoom();
   if (S.objects.length && S.show.objects) drawObjects();
   if (S.goal) { drawCar(S.goal.x, S.goal.y, S.goal.yaw, '#ffb454', 0.55); drawArrow(S.goal.x, S.goal.y, S.goal.yaw, '#ffb454', 0.45); }
   if (S.pose) { drawCar(S.pose.x, S.pose.y, S.pose.yaw, '#37d8c4'); drawArrow(S.pose.x, S.pose.y, S.pose.yaw, '#37d8c4', 0.4); }
@@ -1071,19 +1189,23 @@ function toggleFullscreen() {
   if (document.fullscreenElement) document.exitFullscreen();
   else document.documentElement.requestFullscreen().catch(() => toast('Fullscreen blocked by the browser', 'warn'));
 }
-for (const [id, key] of [['lyMap', 'map'], ['lyGcost', 'gcost'], ['lyLcost', 'lcost'], ['lyScan', 'scan'], ['lyPlan', 'plan'], ['lyObjects', 'objects']]) {
+for (const [id, key] of [['lyMap', 'map'], ['lyGcost', 'gcost'], ['lyLcost', 'lcost'], ['lyScan', 'scan'], ['lyPlan', 'plan'], ['lyObjects', 'objects'], ['lyRoom', 'room']]) {
   $(id).onchange = e => { S.show[key] = e.target.checked; V3.setVisible && V3.setVisible(key, e.target.checked); };
 }
 
+// Sidebar width: no fixed maximum (it used to stop at 560 px) -- only keep
+// at least MIN_MAP_WIDTH of map visible so the view can't vanish.
+const MIN_SIDEBAR_WIDTH = 280, MIN_MAP_WIDTH = 320;
+const clampSidebar = w => Math.max(MIN_SIDEBAR_WIDTH, Math.min(window.innerWidth - MIN_MAP_WIDTH, w));
 const savedSidebar = Number(localStorage.getItem('qcar-sidebar-width'));
-if (savedSidebar >= 280 && savedSidebar <= 560) document.documentElement.style.setProperty('--sidebar-width', savedSidebar + 'px');
+if (savedSidebar >= MIN_SIDEBAR_WIDTH) document.documentElement.style.setProperty('--sidebar-width', clampSidebar(savedSidebar) + 'px');
 let resizing = false;
 $('resizeHandle').addEventListener('pointerdown', e => {
   resizing = true; $('resizeHandle').classList.add('dragging'); $('resizeHandle').setPointerCapture(e.pointerId); e.preventDefault();
 });
 $('resizeHandle').addEventListener('pointermove', e => {
   if (!resizing) return;
-  const width = Math.max(280, Math.min(560, window.innerWidth - e.clientX));
+  const width = clampSidebar(window.innerWidth - e.clientX);
   document.documentElement.style.setProperty('--sidebar-width', width + 'px');
   localStorage.setItem('qcar-sidebar-width', width); resize(); updateUiScale();
 });
@@ -1287,6 +1409,8 @@ function applyDetections(cams) {
 $('micBtn').onclick = () => send({t: 'mic', on: !S.mic.on, source: $('micSource').value});
 $('micSource').onchange = e => send({t: 'mic', on: S.mic.on, source: e.target.value});
 $('exploreBtn').onclick = () => send({t: 'explore', on: !!(S.explore && S.explore.paused)});
+$('undoGlass').onclick = () => send({t: 'clear_hints', what: 'glass'});
+$('undoSkips').onclick = () => send({t: 'clear_hints', what: 'skips'});
 $('voiceBtn').onclick = () => send({t: 'voice', on: !S.voice.on, vol: +$('volume').value});
 $('volume').oninput = e => $('volText').textContent = e.target.value + ' %';
 $('volume').onchange = e => send({t: 'voice', on: S.voice.on, vol: +e.target.value});
