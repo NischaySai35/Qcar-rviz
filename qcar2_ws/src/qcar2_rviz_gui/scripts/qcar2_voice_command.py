@@ -280,7 +280,8 @@ class VoiceCommand(Node):
     def __init__(self):
         super().__init__('qcar2_voice_command')
         share = get_package_share_directory('qcar2_rviz_gui')
-        project_dir = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz')
+        project_dir = os.environ.get('QCAR_RVIZ_DIR') or os.path.join(
+            os.path.expanduser('~'), 'Desktop', 'Qcar-rviz')
 
         # Indian English (was vosk-model-small-en-us-0.15). Used only for the
         # wake phrase, bare stop and sentence boundaries -- see TWO RECOGNISERS.
@@ -357,7 +358,10 @@ class VoiceCommand(Node):
 
         self.nav_pub = self.create_publisher(String, '/qcar2/nav_to_object', 10)
         self.ask_pub = self.create_publisher(String, '/qcar2/ask', 10)
-        self.say_pub = self.create_publisher(String, '/qcar2/say', 10)
+        # Every line this node speaks is a direct reply to the person
+        # ("Yes?", "Stopping") -- urgent: spoken next, never queued behind
+        # callouts (qcar2_announcer.py).
+        self.say_pub = self.create_publisher(String, '/qcar2/say_now', 10)
         self.estop_pub = self.create_publisher(Bool, '/qcar2_estop', LATCHED)
         self.transcript_pub = self.create_publisher(String, '/qcar2/voice_transcript', 10)
         self.cancel_client = self.create_client(

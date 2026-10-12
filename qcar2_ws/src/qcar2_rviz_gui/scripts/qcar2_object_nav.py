@@ -128,7 +128,8 @@ class ObjectNav(Node):
 
     def __init__(self):
         super().__init__('qcar2_object_nav')
-        project_dir = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz')
+        project_dir = os.environ.get('QCAR_RVIZ_DIR') or os.path.join(
+            os.path.expanduser('~'), 'Desktop', 'Qcar-rviz')
 
         self.declare_parameter('objects_file', '')
         self.declare_parameter('map_frame', 'map')

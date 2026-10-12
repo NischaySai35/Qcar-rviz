@@ -31,6 +31,7 @@ import re
 import statistics
 import subprocess
 import sys
+import threading
 import time
 
 START_BELOW_MV = 10800      # first warning when the battery drops below this
@@ -41,6 +42,7 @@ USER = 'nvidia'
 PULSE_SINK = 'alsa_output.platform-sound.analog-stereo'
 PIPER = f'/home/{USER}/Desktop/Qcar-rviz/models/piper/piper/piper'
 VOICE = f'/home/{USER}/Desktop/Qcar-rviz/models/piper/voices/en_US-ryan-medium.onnx'
+CLIENT_NAME = 'qcar2-battery-voice'   # PulseAudio application.name of the warning
 
 
 def log(text):
@@ -73,6 +75,66 @@ def as_user(args, **kw):
                            *[f'{k}={v}' for k, v in env.items()], *args], **kw)
 
 
+class Ducker:
+    """Battery warnings have top priority (operator, 2026-10-09): while one
+    is spoken, every OTHER speech stream on the car (the ROS announcer's
+    answers, safety-shield lines, callouts) is MUTED -- not stopped: it keeps
+    playing silently and is audible again the moment the warning ends.
+
+    A PulseAudio sink-input is muted when it belongs to a client (paplay,
+    speech-dispatcher) other than this script's own player.  Module-owned
+    inputs are left alone: the echo-cancel module's feed to the speaker is
+    one of them, and the warning itself travels through it.  Polled every
+    0.1 s while speaking, so a sentence that STARTS during the warning is
+    muted too."""
+
+    def __init__(self, own_names):
+        self.own_names = own_names
+        self.muted = set()
+        self.stop = threading.Event()
+        self.thread = None
+
+    def others(self):
+        out = as_user(['pactl', 'list', 'sink-inputs'], capture_output=True, text=True,
+                      timeout=3).stdout
+        found = []
+        for block in out.split('Sink Input #')[1:]:
+            idx = block.split('\n', 1)[0].strip()
+            client = re.search(r'^\s*Client:\s*(\S+)', block, re.M)
+            app = re.search(r'application\.name = "([^"]*)"', block)
+            if not idx.isdigit() or client is None or client.group(1) == 'n/a':
+                continue                         # module-owned (echo cancel): keep
+            if app and any(app.group(1).startswith(n) for n in self.own_names):
+                continue                         # the warning itself
+            found.append(idx)
+        return found
+
+    def _run(self):
+        while not self.stop.is_set():
+            try:
+                for idx in self.others():
+                    if idx not in self.muted:
+                        as_user(['pactl', 'set-sink-input-mute', idx, '1'], timeout=3)
+                        self.muted.add(idx)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            self.stop.wait(0.1)
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        time.sleep(0.15)                         # first sweep done before we speak
+        return self
+
+    def __exit__(self, *_exc):
+        self.stop.set()
+        self.thread.join(timeout=2)
+        for idx in self.muted:                   # gone already = harmless error
+            as_user(['pactl', 'set-sink-input-mute', idx, '0'], timeout=3,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return False
+
+
 def speak(text):
     """Say `text` at 100 % volume, then put the volume back. True if played."""
     uid, _ = user_env()
@@ -85,15 +147,20 @@ def speak(text):
     before = m.group(1) if m else None
     as_user(['pactl', 'set-sink-mute', PULSE_SINK, '0'], timeout=5)
     as_user(['pactl', 'set-sink-volume', PULSE_SINK, '100%'], timeout=5)
+    use_piper = os.path.isfile(PIPER) and os.path.isfile(VOICE)
+    # Own stream = what the ducker must NOT mute.
+    own = [CLIENT_NAME] if use_piper else ['speech-dispatcher']
     try:
-        if os.path.isfile(PIPER) and os.path.isfile(VOICE):
-            played = as_user(['sh', '-c',
-                              f'echo "$0" | "{PIPER}" --model "{VOICE}" --output_raw '
-                              f'--length_scale 1.1 2>/dev/null | '
-                              f'paplay --raw --rate=22050 --format=s16le --channels=1', text],
-                             timeout=30).returncode == 0
-        else:
-            played = as_user(['spd-say', '-w', text], timeout=30).returncode == 0
+        with Ducker(own):
+            if use_piper:
+                played = as_user(['sh', '-c',
+                                  f'echo "$0" | "{PIPER}" --model "{VOICE}" --output_raw '
+                                  f'--length_scale 1.1 2>/dev/null | '
+                                  f'paplay --client-name={CLIENT_NAME} --raw --rate=22050 '
+                                  f'--format=s16le --channels=1', text],
+                                 timeout=30).returncode == 0
+            else:
+                played = as_user(['spd-say', '-w', text], timeout=30).returncode == 0
     except subprocess.TimeoutExpired:
         played = False
     finally:

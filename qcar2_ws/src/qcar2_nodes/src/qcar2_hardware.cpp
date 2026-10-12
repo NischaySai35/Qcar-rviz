@@ -4,13 +4,16 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <memory>
 #include <map>
+#include <mutex>
 #include <string>
+#include <utility>
 
 #include "rclcpp/rclcpp.hpp"
 
@@ -270,6 +273,20 @@ public:
                 clearance_rear_ = msg.data[1];
                 clearance_stamp_ns_ = clock_.now().nanoseconds();
             });
+        // [mode, speed, steering] from qcar2_safety_shield -- see
+        // shield_throttle().  Overrides every other drive source.
+        shield_subscriber_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+            "/qcar2/shield_cmd", 10,
+            [this](const std_msgs::msg::Float32MultiArray &msg) {
+                if (msg.data.size() < 3)
+                    return;
+                shield_speed_ = msg.data[1];
+                shield_steering_ = msg.data[2];
+                // [3] emergency: contact imminent -> hard brake; else gentle.
+                shield_emergency_ = msg.data.size() >= 4 && msg.data[3] > 0.5f;
+                shield_mode_ = static_cast<int>(std::lround(msg.data[0]));
+                shield_stamp_ns_ = clock_.now().nanoseconds();
+            });
 
         // Create the subscribers
         led_cmd_subscriber_ = this->create_subscription<qcar2_interfaces::msg::BooleanLeds>("qcar2_led_cmd", 1, std::bind(&QCar2::led_command_callback, this, _1), sub_options);
@@ -456,16 +473,44 @@ private:
     // odometry ran forward while the LiDAR saw the car go back, AMCL kept
     // dragging map->odom to reconcile them ("the whole map shifts"), and
     // the goal failed.  Direction now comes from update_travel_direction().
+    //
+    // TIMED BY THE READS (2026-10-09 live log).  The count is refreshed by
+    // the 1 kHz HIL read on another thread; dividing "change since the last
+    // 15 ms control tick" by 15 ms read 0.00 m/s whenever that thread had not
+    // refreshed it yet -- every other tick at low speed (0.11, 0.00, 0.13,
+    // 0.00 ...) while the car was plainly rolling.  The loop then saw a
+    // stopped car, kicked the throttle, and once even flipped its believed
+    // direction (-0.88 m/s going forward): the safety shield's jitter.  Now
+    // the speed is (count change) / (time between the actual READS) over
+    // the last ~50 ms of reads; no new read = no new information, never
+    // "stopped".
     void update_encoder_speed(double dt)
     {
-        const t_int32 count = motor_encoder_count_.load();
-        if (dt > 0.0 && have_encoder_count_)
+        (void)dt;
+        t_int32 count;
+        int64_t read_ns;
         {
-            const double counts_per_second = (count - previous_encoder_count_) / dt;
-            encoder_speed_ = std::abs((counts_per_second/(720.0*4.0))*((13.0*19.0)/(70.0*30.0))*(2.0*M_PI)*0.033);
+            std::lock_guard<std::mutex> lock(encoder_mutex_);
+            count = motor_encoder_count_.load();
+            read_ns = encoder_read_ns_;
         }
-        previous_encoder_count_ = count;
-        have_encoder_count_ = true;
+        if (read_ns == 0)
+            return;
+        if (encoder_hist_.empty() || encoder_hist_.back().first != read_ns)
+            encoder_hist_.emplace_back(read_ns, count);
+        // Keep ~80 ms of reads (at least two).
+        while (encoder_hist_.size() > 2 && read_ns - encoder_hist_.front().first > 80000000)
+            encoder_hist_.pop_front();
+        // Oldest read at least 40 ms back (else the oldest we have).
+        size_t k = 0;
+        while (k + 1 < encoder_hist_.size() && read_ns - encoder_hist_[k + 1].first >= 40000000)
+            ++k;
+        const auto & old = encoder_hist_[k];
+        const double span = (read_ns - old.first) * 1e-9;
+        if (span < 0.005)
+            return;                                  // not enough reads yet: keep the last value
+        const double counts_per_second = (count - old.second) / span;
+        encoder_speed_ = std::abs((counts_per_second/(720.0*4.0))*((13.0*19.0)/(70.0*30.0))*(2.0*M_PI)*0.033);
     }
 
     // +1.0 forward, -1.0 reverse, from what the MOTOR IS BEING DRIVEN to do.
@@ -474,6 +519,8 @@ private:
     // stopped take it from the sign of the throttle now being applied.  The
     // brake drag (reverse throttle while still rolling forward) therefore
     // cannot flip it early.  Published to /qcar2_joint for the odometry.
+    // (The shield's brake never drives the wheels through zero -- see
+    // shield_throttle() -- which is what keeps this rule sound.)
     void update_travel_direction(double speed_magnitude)
     {
         if (speed_magnitude < kStallSpeed && std::abs(motor_speed_cmd) >= kBreakawayPwm)
@@ -742,14 +789,15 @@ private:
             }
             RCLCPP_INFO(this->get_logger(), "Speed log: %s", path.c_str());
             speed_log_ << "t,desired,target,setpoint,measured,throttle,ff,trim,boost,cruise_gain,"
-                          "breakaway,clear_front,clear_rear,stalled,estop,battery\n";
+                          "breakaway,clear_front,clear_rear,stalled,estop,battery,shield,shield_speed\n";
         }
         speed_log_ << std::fixed << std::setprecision(4)
                    << now.seconds() << ',' << desired_speed << ',' << target << ',' << setpoint_ << ','
                    << measured_speed << ',' << motor_speed_cmd << ',' << ff_log_ << ',' << trim_ << ','
                    << boost_ << ',' << cruise_gain_ << ',' << breakaway_pwm_ << ','
                    << clearance_front_.load() << ',' << clearance_rear_.load() << ','
-                   << stall_latched_ << ',' << estop_engaged_.load() << ',' << battery_voltage << '\n';
+                   << stall_latched_ << ',' << estop_engaged_.load() << ',' << battery_voltage << ','
+                   << (shield_was_active_ ? shield_mode_.load() : 0) << ',' << shield_speed_.load() << '\n';
         if ((now - last_log_flush_).seconds() > 1.0)
         {
             speed_log_.flush();
@@ -823,6 +871,22 @@ private:
             setpoint_ = 0.0;                 // the one hard stop
             return;
         }
+        // SAFETY SHIELD: follow its speed (an emergency BRAKE is handled in
+        // speed_controller(), which zeroes this meanwhile).  It is already
+        // smoothed by the shield (accel/decel-limited, 20 Hz); this only
+        // interpolates between its updates, through zero via zero, and
+        // takes over from Nav2's setpoint where it is -- no jump.  No
+        // clearance cap here: the shield checks every side itself.
+        if (shield_active(now))
+        {
+            const double want = (shield_mode_.load() == 2) ? shield_speed_.load() : 0.0;
+            const double goal = (want * setpoint_ < 0.0) ? 0.0 : want;
+            const double step = kShieldSetpointRate * dt;
+            setpoint_ += std::clamp(goal - setpoint_, -step, step);
+            if (goal == 0.0 && std::abs(setpoint_) < kSetpointStopSpeed)
+                setpoint_ = 0.0;
+            return;
+        }
         const double target = target_speed(now);
         double next;
         if (target == 0.0 || target * setpoint_ < 0.0 || std::abs(target) < std::abs(setpoint_))
@@ -842,6 +906,104 @@ private:
         if (target == 0.0 && std::abs(next) < kSetpointStopSpeed)
             next = 0.0;
         setpoint_ = next;
+    }
+
+    // SAFETY SHIELD (2026-10-09).  qcar2_safety_shield decides, per LiDAR
+    // scan, that something is (or is about to be) within 8 cm of the car,
+    // and how to get away.  Its command beats Nav2 and the drive pad, and it
+    // does NOT go through the gentle setpoint ramp or the 0.08 brake drag
+    // above: those exist so ordinary stops don't skid on the tiles, and they
+    // are exactly why the car took ~0.65 s and ~15 cm to stop from 0.45 m/s
+    // when someone stepped in front of it.  Here:
+    //   * wrong way / hold while rolling: reverse throttle until the wheels
+    //     stop -- kShieldBrakePwm when the shield flags contact imminent,
+    //     the gentler kShieldSoftBrakePwm otherwise;
+    //   * escaping: straight to feed-forward + a firm kick from rest, a
+    //     P term, no ramp, ceiling kShieldPwmMax.
+    // The E-STOP still beats it.  A command older than kShieldTimeout is
+    // ignored (the shield node died or the link stalled) -- the same rule
+    // as every other command relay on this car.
+    bool shield_active(const rclcpp::Time & now) const
+    {
+        if (estop_engaged_ || shield_mode_.load() == 0)
+            return false;
+        return (now.nanoseconds() - shield_stamp_ns_.load()) * 1e-9 <= kShieldTimeout;
+    }
+
+    double shield_throttle(double measured_speed, double dt)
+    {
+        if (dt > 0.0)
+        {
+            const double accel = (std::abs(measured_speed) - shield_previous_speed_) / dt;
+            shield_wheel_accel_ += 0.3 * (accel - shield_wheel_accel_);   // speed is noisy
+        }
+        shield_previous_speed_ = std::abs(measured_speed);
+        const double target = (shield_mode_.load() == 2) ? shield_speed_.load() : 0.0;
+        const double speed = std::abs(measured_speed);
+        const bool rolling = speed >= kStallSpeed || encoder_speed_ >= kStallSpeed;
+        // BACKSTOP 1: faster than anything the shield (0.6) or Nav2 (0.45)
+        // can legitimately produce means the direction belief is wrong and
+        // any throttle may be feeding it: cut to zero and let it coast.
+        if (speed > kShieldRunawaySpeed)
+        {
+            shield_brake_seconds_ = 0.0;
+            return 0.0;
+        }
+        if (!rolling)
+        {
+            // Stopped: a fresh brake may start next time.
+            shield_brake_done_ = false;
+            shield_brake_min_speed_ = 1e9;
+            shield_brake_seconds_ = 0.0;
+        }
+        const bool wrong_way = rolling && (target == 0.0 || measured_speed * target < 0.0);
+        if (wrong_way)
+        {
+            // BRAKE ONLY WHILE IT IS WORKING (2026-10-09 live test).  This car
+            // has no real brake -- "braking" is reverse throttle -- and its
+            // encoder cannot tell which way the wheels turn.  0.25 reverse
+            // spun the light rear wheels backwards within ONE 15 ms tick
+            // (log: 0.52 -> 0.93 m/s) and the car followed them back at up
+            // to 1.7 m/s, all while the code believed it was still braking.
+            // So: reverse throttle only while the wheel speed keeps FALLING.
+            // The first tick it rises again, the wheels have stopped or
+            // reversed: cut to zero and coast until truly stopped; only then
+            // does the escape direction get driven, from rest.
+            if (shield_brake_done_ || (target == 0.0 && speed < 2.0 * kStallSpeed))
+                return 0.0;
+            shield_brake_seconds_ += dt;
+            shield_brake_min_speed_ = std::min(shield_brake_min_speed_, speed);
+            if (speed > shield_brake_min_speed_ + kShieldBrakeRiseCut ||
+                shield_brake_seconds_ > kShieldMaxBrakeSeconds)
+            {
+                shield_brake_done_ = true;     // BACKSTOP 2 included: no stop takes longer
+                return 0.0;
+            }
+            return -travel_direction_ * (shield_emergency_.load() ? kShieldBrakePwm : kShieldSoftBrakePwm);
+        }
+        // Wheels still turning after a cut brake: let them stop first.
+        if (shield_brake_done_)
+            return 0.0;
+        if (target == 0.0)
+            return 0.0;
+        const double direction = (target > 0.0) ? 1.0 : -1.0;
+        const double want = std::abs(target);
+        const double ff = kBreakawayPwm + cruise_gain_ * want;
+        double throttle;
+        if (!rolling)
+            throttle = std::max(ff, breakaway_pwm_ + kShieldKick);   // go now, no slow climb
+        else if (speed > want + 0.10)
+            throttle = 0.0;                                           // coast down to it
+        else
+            throttle = ff + kShieldKp * (want - speed);
+        // TRACTION: wheels gaining speed faster than the tyres can push the
+        // car on these tiles is spin, not travel.  Spin slides the car
+        // sideways out of its escape arc AND corrupts the wheel odometry
+        // (localization then drifts -- the "map shifts").  Back the throttle
+        // off to feed-forward while it lasts.
+        if (rolling && shield_wheel_accel_ > kShieldMaxWheelAccel)
+            throttle = std::min(throttle, ff);
+        return direction * std::clamp(throttle, 0.0, kShieldPwmMax);
     }
 
     void speed_controller()
@@ -878,10 +1040,48 @@ private:
         const double measured_speed = speed_magnitude * travel_direction_;
         travel_direction_shared_.store(travel_direction_);
 
-        if (setpoint_ != 0)
+        const bool shield = shield_active(start_time);
+        if (shield != shield_was_active_)
         {
+            if (shield)
+            {
+                RCLCPP_WARN(this->get_logger(), "SAFETY SHIELD has the wheels (speed %.2f m/s).",
+                            measured_speed);
+                shield_previous_speed_ = std::abs(measured_speed);
+                shield_wheel_accel_ = 0.0;
+                shield_brake_seconds_ = 0.0;
+            }
+            else
+                RCLCPP_INFO(this->get_logger(), "Safety shield released the wheels.");
+            shield_was_active_ = shield;
+        }
+        // The emergency path is for BRAKING only (rolling the wrong way, or
+        // needing to stop, with contact imminent).  All driving -- the
+        // escape too -- goes through the one smooth loop below: switching
+        // between two controllers whenever the emergency flag flickered was
+        // a jolt each time (live log 2026-10-09).
+        const double shield_want = (shield_mode_.load() == 2) ? shield_speed_.load() : 0.0;
+        const bool rolling_now = std::abs(measured_speed) >= kStallSpeed;
+        const bool shield_emergency = shield && shield_emergency_.load() && rolling_now &&
+                                      (shield_want == 0.0 || measured_speed * shield_want < 0.0);
+        if (shield_emergency)
+        {
+            // Contact imminent: the dedicated brake-while-it-works path.
+            // Normal driving restarts from rest, through the ramp, after.
+            setpoint_ = 0.0;
+            was_moving_ = false;
+            boost_ = 0.0;
+            trim_ = 0.0;
+            stall_pinned_seconds_ = 0.0;
+            motor_speed_cmd = shield_throttle(measured_speed, dt);
+        }
+        else if (setpoint_ != 0)
+        {
+            // Nav2 -- or the shield's (already smoothed) speed, which
+            // update_setpoint() follows: the same tuned, smooth loop.
             command_is_zero_ = false;
-            update_steering_bias(delta_time.seconds(), measured_speed);
+            if (!shield)
+                update_steering_bias(delta_time.seconds(), measured_speed);   // learns Nav2's steering only
             motor_speed_cmd = drive_throttle(dt, measured_speed);
         }
         else
@@ -906,7 +1106,7 @@ private:
                 (start_time - command_zero_since_).seconds() > kStallReleaseZeroSeconds)
                 set_stall_latched(false);
         }
-        if (stall_latched_)
+        if (stall_latched_ && !shield)
             motor_speed_cmd = 0.0;
         publish_stall_state(start_time);
         log_speed(start_time, target_speed(start_time), measured_speed);
@@ -928,7 +1128,8 @@ private:
         // Corrected here, at the single point every steering command from
         // every source (manual drive, Nav2) funnels through on its way to
         // the servo -- see update_steering_bias() above.
-        buffer[0] = std::clamp(desired_steering - steering_bias_, -kSteeringStopRad, kSteeringStopRad);
+        const double steering = shield ? shield_steering_.load() : desired_steering;
+        buffer[0] = std::clamp(steering - steering_bias_, -kSteeringStopRad, kSteeringStopRad);
         buffer[1] = motor_speed_cmd;
 
         t_error result;
@@ -1065,7 +1266,13 @@ private:
         joint_speed_measured = OIBuffer[7];
         // Signed quadrature count; the speed controller reads it to recover
         // the direction of travel that channel 14000 above cannot supply.
-        motor_encoder_count_.store(ENBuffer[0]);
+        {
+            // Count AND the moment it was read, together -- see
+            // update_encoder_speed().
+            std::lock_guard<std::mutex> lock(encoder_mutex_);
+            motor_encoder_count_.store(ENBuffer[0]);
+            encoder_read_ns_ = std::chrono::steady_clock::now().time_since_epoch().count();
+        }
         joint_state.effort.clear();
         joint_state.effort.push_back(AIBuffer[4]);
 
@@ -1268,8 +1475,9 @@ private:
     // Signed motor encoder count, written by timer_callback() at 1 kHz and
     // read by speed_controller() at ~67 Hz on a different executor thread.
     std::atomic<t_int32> motor_encoder_count_{0};
-    t_int32 previous_encoder_count_{0};
-    bool have_encoder_count_{false};
+    std::mutex encoder_mutex_;                       // count + read time, written together
+    int64_t encoder_read_ns_{0};                     // steady clock, when the count was read
+    std::deque<std::pair<int64_t, t_int32>> encoder_hist_;   // recent (read time, count)
     double travel_direction_{1.0};
     // Copy for timer_callback()'s /qcar2_joint publish (another thread).
     std::atomic<double> travel_direction_shared_{1.0};
@@ -1370,6 +1578,32 @@ private:
     std::atomic<int64_t> clearance_stamp_ns_{0};
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_subscriber_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr clearance_subscriber_;
+    // Safety shield -- see shield_throttle().
+    static constexpr double kShieldTimeout = 0.15;            // s: older command = shield not running
+    // 0.25 spun the wheels backwards in one tick (2026-10-09); the brake is
+    // now also cut the moment it stops working -- see shield_throttle().
+    static constexpr double kShieldBrakePwm = 0.18;           // reverse throttle, emergency stop
+    static constexpr double kShieldSoftBrakePwm = 0.10;       // reverse throttle, ordinary stop
+    static constexpr double kShieldSetpointRate = 2.0;        // m/s^2: only interpolates the shield's smoothed speed
+    std::atomic<bool> shield_emergency_{false};
+    static constexpr double kShieldPwmMax = 0.16;             // escape ceiling (~0.6 m/s needs ~0.15; normal driving <= 0.12)
+    static constexpr double kShieldKick = 0.02;               // above learned breakaway, from rest
+    static constexpr double kShieldKp = 0.30;                 // throttle per m/s below target
+    std::atomic<int> shield_mode_{0};
+    std::atomic<double> shield_speed_{0.0};
+    std::atomic<double> shield_steering_{0.0};
+    std::atomic<int64_t> shield_stamp_ns_{0};
+    static constexpr double kShieldMaxWheelAccel = 2.0;       // m/s^2: faster = spin (= odometry cap)
+    static constexpr double kShieldRunawaySpeed = 0.85;       // m/s: above = direction belief wrong
+    static constexpr double kShieldMaxBrakeSeconds = 0.5;     // longest believable hard stop
+    double shield_brake_seconds_ = 0.0;
+    static constexpr double kShieldBrakeRiseCut = 0.06;       // m/s above the lowest = stopped/reversed
+    double shield_brake_min_speed_ = 1e9;
+    bool shield_brake_done_ = false;
+    double shield_wheel_accel_ = 0.0;
+    double shield_previous_speed_ = 0.0;
+    bool shield_was_active_ = false;
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr shield_subscriber_;
     // Set once the shutdown stop has been written; blocks any further motor
     // writes so the zero cannot be overwritten during teardown.
     std::atomic<bool> motors_stopped_{false};

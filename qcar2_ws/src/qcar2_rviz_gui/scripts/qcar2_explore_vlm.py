@@ -87,7 +87,8 @@ CAMERAS = {
     'right': ('/right/camera/preview', -math.pi / 2, math.radians(90.0)),
 }
 WHERE = ('none', 'left', 'center', 'right')
-AHEAD = ('open_floor', 'under_furniture', 'wall', 'glass', 'doorway', 'cluttered')
+CONFIRM_M = 0.9          # a bump this close to a suspected glass line confirms it
+AHEAD =('open_floor', 'under_furniture', 'wall', 'glass', 'doorway', 'cluttered')
 
 LOOK_PROMPT = (
     'This photo is from the {cam} camera of a small robot car, 18 cm above the '
@@ -551,8 +552,10 @@ class ExploreVlm(Node):
 
     def on_bumps(self, msg):
         """A suspected glass line becomes a real no-go wall once the car has
-        physically bumped within 0.5 m of it: the camera said glass, and the
-        bump says exactly where."""
+        physically bumped within CONFIRM_M of it: the camera said glass, and
+        the bump says exactly where. Was 0.5 m; on my_room7 (2026-10-08) the
+        model's line sat ~0.65 m from the real pane, so the bump never
+        confirmed it and the car kept going back to the glass."""
         pts = [(float(x), float(y)) for x, y in
                point_cloud2.read_points(msg, field_names=('x', 'y'), skip_nans=True)]
         changed = False
@@ -560,7 +563,7 @@ class ExploreVlm(Node):
             for c in self.closures:
                 if c['kind'] != 'glass' or c['apply'] or not pts:
                     continue
-                if min(seg_distance(px, py, c) for px, py in pts) < 0.5:
+                if min(seg_distance(px, py, c) for px, py in pts) < CONFIRM_M:
                     c['apply'], c['status'] = True, 'confirmed by bump'
                     changed = True
         if changed:

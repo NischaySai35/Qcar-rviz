@@ -79,14 +79,21 @@ def generate_launch_description():
     declare_use_speed_slider_cmd = DeclareLaunchArgument(
         'use_speed_slider', default_value='false',
         description='Open the old Tk speed-limit window (the browser console has these controls)')
+    declare_safety_shield_cmd = DeclareLaunchArgument(
+        'safety_shield', default_value='true',
+        description='Start with the safety shield ON (keep 8 cm from everything, brake hard '
+                    'and drive away from anything coming at the car). The console button '
+                    'switches it at any time.')
     declare_use_llm_cmd = DeclareLaunchArgument(
         'use_llm', default_value='true',
         description='Run the local Cosmos-Reason2 vision-language model (llama-server) '
                     'that the assistant uses for free-form questions and "what do you see"')
     declare_llm_size_cmd = DeclareLaunchArgument(
-        'llm_size', default_value='2B',
-        description='Cosmos-Reason2 size: 2B (Q8, ~0.9 s per scene description), 8B (Q4, '
-                    'slower, better answers) or auto (8B once fully downloaded)')
+        # 8B by default (operator, 2026-10-09): better answers; llm_size:=2B
+        # for the faster, smaller one.
+        'llm_size', default_value='8B',
+        description='Cosmos-Reason2 size: 8B (Q4, default, better answers), 2B (Q8, '
+                    '~0.9 s per scene description, faster) or auto (8B once fully downloaded)')
 
     # Point bt_navigator at the Ackermann behavior tree.  The stock tree's
     # recovery RoundRobin contains <BackUp backup_dist="0.30">, which is what
@@ -196,6 +203,19 @@ def generate_launch_description():
         name='qcar2_bump_guard',
         output='screen',
     )
+    # Never touch anything: on every LiDAR scan, brake hard and drive away
+    # from whatever is within 8 cm or coming at the car, without backing into
+    # anything else -- see qcar2_nodes/src/shield_core.hpp.  Its command
+    # overrides Nav2 inside qcar2_hardware.  Console button: /qcar2/shield_enable.
+    safety_shield_node = Node(
+        package='qcar2_nodes',
+        executable='qcar2_safety_shield',
+        name='qcar2_safety_shield',
+        output='screen',
+        # Speeds/distances: the shield_core.hpp defaults (calm 0.45 m/s cap,
+        # up to 0.6 only for someone coming fast; 20 cm kept from people).
+        parameters=[{'enabled': ParameterValue(LaunchConfiguration('safety_shield'), value_type=bool)}],
+    )
     # Low obstacles under the LiDAR plane, from the RealSense depth -- see
     # qcar2_depth_obstacles.py.
     depth_obstacles_node = Node(
@@ -227,9 +247,12 @@ def generate_launch_description():
         # Operator request (2026-10-05): no "television on the right" object
         # callouts in navigation, and obstacle warnings only when something
         # is genuinely close -- under 80 cm (node default is 1.5 m).
+        # Voice ON by default in navigation (2026-10-09); the console
+        # publishes the same default, and its VOICE button still switches it.
         parameters=[{'mode': 'navigation',
                      'announce_objects': False,
-                     'obstacle_distance': 0.8}],
+                     'obstacle_distance': 0.8,
+                     'voice_enabled_default': True}],
     )
 
     # Ties "2D Pose Estimate" to cancelling the active goal and clearing the
@@ -366,7 +389,8 @@ def generate_launch_description():
         if LaunchConfiguration('use_llm').perform(context).lower() != 'true':
             return []
         size = LaunchConfiguration('llm_size').perform(context).upper()
-        models = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz',
+        models = os.path.join(os.environ.get('QCAR_RVIZ_DIR') or
+                              os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz'),
                               'models', 'cosmos-reason2')
         if size == 'AUTO':
             # 8B when its download is complete (~5.0 GB), else 2B.
@@ -430,6 +454,7 @@ def generate_launch_description():
         declare_autostart_cmd,
         declare_use_speed_slider_cmd,
         declare_use_voice_cmd,
+        declare_safety_shield_cmd,
         declare_use_llm_cmd,
         declare_llm_size_cmd,
         OpaqueFunction(function=validate_map_file),
@@ -443,6 +468,7 @@ def generate_launch_description():
         collision_monitor_lifecycle_manager,
         nav2_qcar2_converter,
         bump_guard_node,
+        safety_shield_node,
         depth_obstacles_node,
         nav_visualizer_node,
         goal_reset_node,

@@ -354,7 +354,8 @@ class ObjectMapper(Node):
 
         share = get_package_share_directory('qcar2_rviz_gui')
         default_vocab = os.path.join(share, 'config', 'object_vocabulary.yaml')
-        project_dir = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz')
+        project_dir = os.environ.get('QCAR_RVIZ_DIR') or os.path.join(
+            os.path.expanduser('~'), 'Desktop', 'Qcar-rviz')
 
         self.declare_parameter('vocabulary_file', default_vocab)
         # YOLO-World v2 LARGE (was the small model). Measured 2026-09-25 on 150

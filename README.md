@@ -337,6 +337,20 @@ sits there with no prompt — that is normal; closing it closes the tunnel.
 If you launched with `web_port:=<n>`, replace `8080` with `<n>` in both
 commands.
 
+### Open the project in VS Code from a laptop (Remote-SSH)
+On the laptop (needs the VS Code *Remote - SSH* extension):
+```bash
+code --remote ssh-remote+nvidia@10.164.58.236 /home/nvidia/Desktop/Qcar-rviz
+```
+**The IP changes** between networks and reboots — check the current one on the
+**QCar's display** (or with the `ip -4 -o addr show wlan0` command above) and
+replace `10.164.58.236` with it.
+
+Or use the full desktop:
+- **Remote Desktop (RDC app)** → enter the car IP, log in as `nvidia`. It opens a
+  **separate XFCE session** (not GNOME — `~/.xsession` starts XFCE for xrdp), not the live screen.
+- **The live screen** (GNOME on the car's monitor) → VNC viewer to `<car-ip>:5900`.
+
 ### A) Build a new map (Mapping mode)
 ```bash
 scripts/start_mapping.sh my_room     # name optional; default map_<date>_<time>
@@ -788,7 +802,7 @@ ros2 service call /local_costmap/clear_entirely_local_costmap nav2_msgs/srv/Clea
   project scripts (or reload `qcar2_full_gui.rviz` from RViz's File menu).
 - **No map in navigation mode** → mapping has not produced a saved map yet.
   Run `scripts/start_mapping.sh my_room`, Ctrl+C when done, then start navigation with
-  `scripts/start_navigate.sh map:=$PWD/maps/my_room.yaml`. The launcher now
+  `scripts/start_navigate.sh map:=/home/nvidia/Desktop/Qcar-rviz/maps/my_room.yaml`. The launcher now
   stops with a clear message instead of opening a misleading empty view.
 - **RViz shows nothing / no TF** → make sure `scripts/start_mapping.sh` or
   `start_navigate.sh` is actually still running in its terminal and hasn't

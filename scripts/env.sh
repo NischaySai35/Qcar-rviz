@@ -49,6 +49,10 @@ else
     echo "[env.sh] Workspace not built yet. Run scripts/build.sh first."
 fi
 
+# The project root THIS env.sh lives in. Nodes and launch files read it to
+# find models/, maps/ and scripts/, so a copy of the project on another path
+# uses its own files instead of ~/Desktop/Qcar-rviz (their fallback).
+export QCAR_RVIZ_DIR="$PROJECT_DIR"
 export QCAR_RVIZ_MAPS_DIR="$PROJECT_DIR/maps"
 
 # xrdp remote desktop and SSH/VS Code terminals leave this unset, and without

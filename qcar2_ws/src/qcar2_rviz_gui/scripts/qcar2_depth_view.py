@@ -27,6 +27,7 @@ the centre is that close and the sensor returns nothing) and gets noisy past
 cannot produce a wild number.
 """
 
+import math
 import time
 
 import cv2
@@ -40,6 +41,8 @@ from sensor_msgs.msg import Image
 
 MIN_VALID_MM = 150          # below the D435's minimum range: treat as no data
 MAX_SHOWN_MM = 10000
+COLOR_HFOV_DEG = 69.4       # D435 RGB lens; gives the focal length in pixels
+FLOOR_TOL_M = 0.05          # within this of the floor plane = floor, not an obstacle
 
 
 def to_bgr(msg):
@@ -61,6 +64,33 @@ def patch_median(depth, cx, cy, half):
     p = depth[max(0, cy - half):min(h, cy + half + 1), max(0, cx - half):min(w, cx + half + 1)]
     v = p[(p >= MIN_VALID_MM) & (p <= MAX_SHOWN_MM)]
     return float(np.median(v)) if v.size >= max(4, p.size // 4) else None
+
+
+def without_floor(depth):
+    """Depth with the floor blanked out (0 = no data).
+
+    "nearest" used to be the floor just past the bumper in EVERY frame
+    (always ~46 cm on 2026-10-08) because the floor is the closest thing in
+    view. A pixel's drop below the camera is depth * (v - cy) / f; on the
+    floor that equals the camera's height. The height is measured from the
+    bottom rows of each frame (mostly floor), so no mounting value is needed.
+    When the bottom of the view is not floor (nose against a wall) the
+    estimate falls outside a plausible range and nothing is removed.
+    """
+    h, w = depth.shape
+    f = (w / 2.0) / math.tan(math.radians(COLOR_HFOV_DEG / 2.0))
+    rows = np.arange(h, dtype=np.float32)[:, None] - h / 2.0
+    drop = depth.astype(np.float32) / 1000.0 * rows / f       # metres below the lens
+    valid = (depth >= MIN_VALID_MM) & (depth <= MAX_SHOWN_MM)
+    bottom = drop[int(h * 0.8):][valid[int(h * 0.8):]]
+    if bottom.size < 50:
+        return depth
+    cam_h = float(np.median(bottom))
+    if not 0.08 <= cam_h <= 0.8:
+        return depth
+    out = depth.copy()
+    out[valid & (drop > cam_h - FLOOR_TOL_M)] = 0
+    return out
 
 
 def nearest_block(depth, block=16):
@@ -174,7 +204,7 @@ class DepthView(Node):
         else:
             c = patch_median(depth, cx, cy, 5)
             label(img, cm(c) if c is not None else '<20 cm / --', cx + 14, cy - 10, white)
-            near = nearest_block(depth)
+            near = nearest_block(without_floor(depth))
             if near is not None:
                 nx, ny, nmm = near
                 cv2.circle(img, (nx, ny), 12, yellow, 2)

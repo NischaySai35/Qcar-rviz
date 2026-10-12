@@ -33,7 +33,7 @@ from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy)
 from sensor_msgs.msg import Imu, JointState
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32MultiArray
 from tf2_ros import TransformBroadcaster
 
 
@@ -49,6 +49,10 @@ WHEELBASE_M = 0.256
 # instant stop, is handled by qcar2_bump_guard.py's drive_blocked freeze.
 MAX_ODOM_ACCEL = 1.0
 MAX_ODOM_DECEL = 2.0
+# While the safety shield drives: its fastest command acceleration
+# (accel_up_fast in shield_core.hpp, reached only when someone comes at the
+# car fast; 0.8 otherwise).  Anything quicker is wheel spin, not travel.
+SHIELD_ODOM_ACCEL = 1.5
 # QCar2 motor encoder -> wheel linear-speed conversion. Keep this identical
 # to qcar2_hardware.cpp's speed controller.
 COUNTS_TO_MPS = ((13.0 * 19.0) / (70.0 * 30.0)) * (2.0 * math.pi * WHEEL_RADIUS_M) / (720.0 * 4.0)
@@ -73,6 +77,12 @@ class WheelImuOdometry(Node):
                              history=QoSHistoryPolicy.KEEP_LAST)
         self.create_subscription(Bool, '/qcar2/drive_blocked', self._blocked, latched)
         self.blocked = False
+        # The safety shield (navigation) bypasses the hardware ramp and really
+        # does accelerate harder than MAX_ODOM_ACCEL -- traction-limited to
+        # SHIELD_ODOM_ACCEL in qcar2_hardware.cpp.  Capping at 1.0 then would
+        # under-count a genuine escape and drag localization ("map shifts").
+        self.create_subscription(Float32MultiArray, '/qcar2/shield_cmd', self._shield, 20)
+        self.shield_until = 0.0
         self.travel_speed = 0.0
 
         self.counts_per_second = None
@@ -97,6 +107,12 @@ class WheelImuOdometry(Node):
 
     def _blocked(self, message):
         self.blocked = bool(message.data)
+
+    def _shield(self, message):
+        if len(message.data) >= 1 and round(message.data[0]) != 0:
+            # Shield driving (or braking): allow its harder acceleration for
+            # a moment beyond its last command too.
+            self.shield_until = time.monotonic() + 0.5
 
     def _command(self, message):
         try:
@@ -152,7 +168,8 @@ class WheelImuOdometry(Node):
         # against the LiDAR to detect slip in the first place.
         speeding_up = abs(linear_speed) > abs(self.travel_speed) and \
             linear_speed * self.travel_speed >= 0.0
-        step = (MAX_ODOM_ACCEL if speeding_up else MAX_ODOM_DECEL) * dt
+        max_accel = SHIELD_ODOM_ACCEL if time.monotonic() < self.shield_until else MAX_ODOM_ACCEL
+        step = (max_accel if speeding_up else MAX_ODOM_DECEL) * dt
         travel_speed = min(max(linear_speed, self.travel_speed - step),
                            self.travel_speed + step)
         if self.blocked:

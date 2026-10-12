@@ -2,7 +2,7 @@
   "version": 1,
   "map": "my_room5",
   "frame_id": "map",
-  "created": "2026-09-25T11:00:01",
+  "created": "2026-10-08T07:55:54",
   "vocabulary": [
     "air cooler",
     "television",
@@ -118,844 +118,920 @@
   },
   "objects": [
     {
-      "id": 1,
+      "id": 45,
       "label": "air cooler",
-      "x": 4.965,
-      "y": 0.427,
-      "hits": 204,
+      "x": -2.322,
+      "y": 5.184,
+      "hits": 42,
       "misses": 0.0,
-      "confidence": 0.834,
-      "label_confidence": 0.961,
+      "confidence": 0.741,
+      "label_confidence": 0.411,
       "alternatives": [
         {
+          "label": "armchair",
+          "score": 3.09
+        },
+        {
           "label": "television",
-          "score": 0.96
+          "score": 2.17
         },
         {
-          "label": "staircase",
-          "score": 0.19
-        },
-        {
-          "label": "computer monitor",
-          "score": 0.19
+          "label": "backpack",
+          "score": 1.84
         }
       ],
-      "closest_seen_m": 1.44,
+      "closest_seen_m": 1.61,
       "cameras": [
         "front",
         "left",
         "rear"
-      ]
+      ],
+      "name": "air cooler"
     },
     {
-      "id": 70,
+      "id": 81,
       "label": "air cooler",
-      "x": 5.053,
-      "y": -7.553,
-      "hits": 11,
-      "misses": 4.0,
-      "confidence": 0.742,
-      "label_confidence": 0.706,
+      "x": -8.554,
+      "y": 0.823,
+      "hits": 26,
+      "misses": 0.0,
+      "confidence": 0.74,
+      "label_confidence": 0.954,
       "alternatives": [
         {
           "label": "television",
-          "score": 0.47
+          "score": 0.17
         },
         {
-          "label": "sofa",
-          "score": 0.42
+          "label": "laptop",
+          "score": 0.11
         }
       ],
-      "closest_seen_m": 1.6,
+      "closest_seen_m": 2.2,
       "cameras": [
         "front",
+        "right"
+      ],
+      "name": "air cooler 2"
+    },
+    {
+      "id": 99,
+      "label": "air cooler",
+      "x": -7.379,
+      "y": 1.934,
+      "hits": 5,
+      "misses": 0.0,
+      "confidence": 0.71,
+      "label_confidence": 1.0,
+      "alternatives": [],
+      "closest_seen_m": 3.48,
+      "cameras": [
         "rear"
-      ]
+      ],
+      "name": "air cooler 3"
     },
     {
-      "id": 3,
+      "id": 2,
       "label": "armchair",
-      "x": 1.097,
-      "y": -1.884,
-      "hits": 724,
+      "x": -3.078,
+      "y": -0.835,
+      "hits": 189,
       "misses": 0.0,
-      "confidence": 0.838,
-      "label_confidence": 0.476,
+      "confidence": 0.839,
+      "label_confidence": 0.446,
       "alternatives": [
-        {
-          "label": "laptop",
-          "score": 35.78
-        },
         {
           "label": "sofa",
-          "score": 30.52
+          "score": 16.37
         },
         {
           "label": "television",
-          "score": 27.66
-        }
-      ],
-      "closest_seen_m": 1.28,
-      "cameras": [
-        "left",
-        "rear",
-        "right"
-      ]
-    },
-    {
-      "id": 4,
-      "label": "armchair",
-      "x": -1.576,
-      "y": -1.002,
-      "hits": 537,
-      "misses": 0.0,
-      "confidence": 0.811,
-      "label_confidence": 0.484,
-      "alternatives": [
-        {
-          "label": "laptop",
-          "score": 20.73
-        },
-        {
-          "label": "television",
-          "score": 20.0
-        },
-        {
-          "label": "chair",
-          "score": 4.8
-        }
-      ],
-      "closest_seen_m": 2.51,
-      "cameras": [
-        "left",
-        "rear",
-        "right"
-      ]
-    },
-    {
-      "id": 12,
-      "label": "armchair",
-      "x": 0.725,
-      "y": -4.898,
-      "hits": 75,
-      "misses": 21.0,
-      "confidence": 0.746,
-      "label_confidence": 0.824,
-      "alternatives": [
-        {
-          "label": "television",
-          "score": 1.65
-        },
-        {
-          "label": "coffee table",
-          "score": 0.49
+          "score": 9.07
         },
         {
           "label": "laptop",
-          "score": 0.34
+          "score": 6.2
         }
       ],
-      "closest_seen_m": 0.61,
-      "cameras": [
-        "front",
-        "left",
-        "right"
-      ]
-    },
-    {
-      "id": 33,
-      "label": "armchair",
-      "x": 5.123,
-      "y": -4.003,
-      "hits": 130,
-      "misses": 14.0,
-      "confidence": 0.653,
-      "label_confidence": 0.493,
-      "alternatives": [
-        {
-          "label": "television",
-          "score": 9.79
-        },
-        {
-          "label": "floor lamp",
-          "score": 0.92
-        },
-        {
-          "label": "sofa",
-          "score": 0.75
-        }
-      ],
-      "closest_seen_m": 0.9,
+      "closest_seen_m": 0.57,
       "cameras": [
         "front",
         "left",
         "rear",
         "right"
-      ]
-    },
-    {
-      "id": 103,
-      "label": "armchair",
-      "x": 4.003,
-      "y": -7.302,
-      "hits": 22,
-      "misses": 0.0,
-      "confidence": 0.743,
-      "label_confidence": 0.688,
-      "alternatives": [
-        {
-          "label": "television",
-          "score": 2.04
-        },
-        {
-          "label": "sofa",
-          "score": 0.5
-        },
-        {
-          "label": "air cooler",
-          "score": 0.13
-        }
       ],
-      "closest_seen_m": 0.8,
-      "cameras": [
-        "front",
-        "left",
-        "rear"
-      ]
+      "name": "armchair"
     },
     {
-      "id": 110,
+      "id": 18,
       "label": "armchair",
-      "x": 1.242,
-      "y": -3.599,
+      "x": 1.251,
+      "y": 1.114,
       "hits": 21,
       "misses": 0.0,
-      "confidence": 0.743,
-      "label_confidence": 0.581,
+      "confidence": 0.712,
+      "label_confidence": 0.457,
       "alternatives": [
         {
-          "label": "desk",
-          "score": 1.22
-        },
-        {
-          "label": "television",
-          "score": 0.8
+          "label": "cabinet",
+          "score": 1.78
         },
         {
           "label": "floor lamp",
-          "score": 0.15
+          "score": 0.65
+        },
+        {
+          "label": "laptop",
+          "score": 0.54
         }
       ],
-      "closest_seen_m": 2.3,
+      "closest_seen_m": 0.72,
       "cameras": [
         "front",
-        "left",
-        "right"
-      ]
+        "rear"
+      ],
+      "name": "armchair 2"
     },
     {
-      "id": 114,
+      "id": 19,
       "label": "armchair",
-      "x": -1.365,
-      "y": -4.018,
-      "hits": 15,
-      "misses": 0.0,
-      "confidence": 0.781,
-      "label_confidence": 0.704,
+      "x": -2.54,
+      "y": 3.68,
+      "hits": 283,
+      "misses": 1.0,
+      "confidence": 0.849,
+      "label_confidence": 0.371,
       "alternatives": [
         {
-          "label": "sofa",
-          "score": 0.55
-        },
-        {
-          "label": "television",
-          "score": 0.23
-        }
-      ],
-      "closest_seen_m": 4.53,
-      "cameras": [
-        "front",
-        "left"
-      ]
-    },
-    {
-      "id": 6,
-      "label": "chair",
-      "x": -1.736,
-      "y": -3.489,
-      "hits": 39,
-      "misses": 0.0,
-      "confidence": 0.81,
-      "label_confidence": 0.537,
-      "alternatives": [
-        {
-          "label": "television",
-          "score": 2.37
-        },
-        {
-          "label": "floor lamp",
-          "score": 0.52
-        },
-        {
-          "label": "armchair",
-          "score": 0.42
-        }
-      ],
-      "closest_seen_m": 1.73,
-      "cameras": [
-        "front",
-        "rear",
-        "right"
-      ]
-    },
-    {
-      "id": 7,
-      "label": "chair",
-      "x": -1.768,
-      "y": -4.502,
-      "hits": 34,
-      "misses": 0.0,
-      "confidence": 0.73,
-      "label_confidence": 0.527,
-      "alternatives": [
-        {
-          "label": "laptop",
-          "score": 1.33
-        },
-        {
-          "label": "television",
-          "score": 1.2
-        }
-      ],
-      "closest_seen_m": 1.42,
-      "cameras": [
-        "front",
-        "rear",
-        "right"
-      ]
-    },
-    {
-      "id": 79,
-      "label": "chair",
-      "x": 1.092,
-      "y": 0.722,
-      "hits": 6,
-      "misses": 2.0,
-      "confidence": 0.746,
-      "label_confidence": 0.508,
-      "alternatives": [
-        {
-          "label": "armchair",
-          "score": 0.19
-        },
-        {
-          "label": "television",
-          "score": 0.1
-        },
-        {
-          "label": "laptop",
-          "score": 0.1
-        }
-      ],
-      "closest_seen_m": 4.31,
-      "cameras": [
-        "front",
-        "right"
-      ]
-    },
-    {
-      "id": 133,
-      "label": "chair",
-      "x": -1.94,
-      "y": -0.624,
-      "hits": 12,
-      "misses": 0.0,
-      "confidence": 0.592,
-      "label_confidence": 0.8,
-      "alternatives": [
-        {
-          "label": "television",
-          "score": 0.35
+          "label": "backpack",
+          "score": 30.08
         },
         {
           "label": "sofa",
-          "score": 0.22
-        }
-      ],
-      "closest_seen_m": 1.96,
-      "cameras": [
-        "rear"
-      ]
-    },
-    {
-      "id": 5,
-      "label": "desk",
-      "x": 2.456,
-      "y": -2.63,
-      "hits": 399,
-      "misses": 0.0,
-      "confidence": 0.784,
-      "label_confidence": 0.586,
-      "alternatives": [
+          "score": 25.7
+        },
         {
           "label": "television",
-          "score": 18.2
-        },
-        {
-          "label": "armchair",
-          "score": 13.9
-        },
-        {
-          "label": "sofa",
-          "score": 12.43
+          "score": 24.86
         }
       ],
-      "closest_seen_m": 0.92,
+      "closest_seen_m": 0.25,
       "cameras": [
         "front",
         "left",
         "rear",
         "right"
-      ]
-    },
-    {
-      "id": 57,
-      "label": "desk",
-      "x": 1.098,
-      "y": -2.906,
-      "hits": 7,
-      "misses": 4.0,
-      "confidence": 0.757,
-      "label_confidence": 0.471,
-      "alternatives": [
-        {
-          "label": "trash can",
-          "score": 0.45
-        },
-        {
-          "label": "armchair",
-          "score": 0.33
-        }
       ],
-      "closest_seen_m": 2.88,
-      "cameras": [
-        "front",
-        "right"
-      ]
+      "name": "armchair 3"
     },
     {
-      "id": 73,
-      "label": "desk",
-      "x": 4.996,
-      "y": -2.346,
-      "hits": 12,
-      "misses": 0.0,
-      "confidence": 0.838,
-      "label_confidence": 0.71,
+      "id": 41,
+      "label": "armchair",
+      "x": -1.441,
+      "y": -2.273,
+      "hits": 22,
+      "misses": 6.0,
+      "confidence": 0.765,
+      "label_confidence": 0.959,
       "alternatives": [
         {
-          "label": "air cooler",
-          "score": 0.39
-        }
-      ],
-      "closest_seen_m": 2.62,
-      "cameras": [
-        "front",
-        "rear"
-      ]
-    },
-    {
-      "id": 11,
-      "label": "floor lamp",
-      "x": -1.553,
-      "y": 0.438,
-      "hits": 194,
-      "misses": 8.0,
-      "confidence": 0.87,
-      "label_confidence": 0.922,
-      "alternatives": [
-        {
-          "label": "armchair",
-          "score": 2.29
+          "label": "laptop",
+          "score": 0.09
         },
         {
           "label": "chair",
-          "score": 1.07
-        },
-        {
-          "label": "television",
-          "score": 0.42
+          "score": 0.08
         }
       ],
-      "closest_seen_m": 1.93,
+      "closest_seen_m": 4.04,
       "cameras": [
+        "left",
         "rear",
         "right"
-      ]
-    },
-    {
-      "id": 31,
-      "label": "floor lamp",
-      "x": 0.034,
-      "y": 1.031,
-      "hits": 73,
-      "misses": 3.0,
-      "confidence": 0.811,
-      "label_confidence": 0.98,
-      "alternatives": [
-        {
-          "label": "sofa",
-          "score": 0.18
-        },
-        {
-          "label": "computer monitor",
-          "score": 0.15
-        },
-        {
-          "label": "television",
-          "score": 0.11
-        }
       ],
-      "closest_seen_m": 2.85,
-      "cameras": [
-        "front",
-        "left",
-        "rear"
-      ]
+      "name": "armchair 4"
     },
     {
-      "id": 60,
-      "label": "floor lamp",
-      "x": 1.785,
-      "y": 0.866,
-      "hits": 19,
-      "misses": 0.0,
-      "confidence": 0.745,
-      "label_confidence": 0.67,
+      "id": 78,
+      "label": "armchair",
+      "x": -6.7,
+      "y": -2.494,
+      "hits": 8,
+      "misses": 2.0,
+      "confidence": 0.802,
+      "label_confidence": 0.479,
       "alternatives": [
         {
-          "label": "laptop",
-          "score": 0.8
+          "label": "chair",
+          "score": 0.54
         },
         {
           "label": "desk",
-          "score": 0.32
-        },
-        {
-          "label": "chair",
-          "score": 0.18
+          "score": 0.22
         }
       ],
-      "closest_seen_m": 2.57,
+      "closest_seen_m": 3.36,
       "cameras": [
         "front",
-        "rear",
-        "right"
-      ]
-    },
-    {
-      "id": 69,
-      "label": "floor lamp",
-      "x": 5.398,
-      "y": -2.64,
-      "hits": 13,
-      "misses": 1.0,
-      "confidence": 0.599,
-      "label_confidence": 0.795,
-      "alternatives": [
-        {
-          "label": "air cooler",
-          "score": 0.72
-        }
+        "rear"
       ],
-      "closest_seen_m": 0.99,
-      "cameras": [
-        "left",
-        "rear",
-        "right"
-      ]
+      "name": "armchair 5"
     },
     {
-      "id": 56,
-      "label": "sofa",
-      "x": 5.233,
-      "y": -5.3,
-      "hits": 107,
-      "misses": 2.0,
+      "id": 100,
+      "label": "armchair",
+      "x": -3.758,
+      "y": -1.876,
+      "hits": 30,
+      "misses": 0.0,
       "confidence": 0.831,
-      "label_confidence": 0.555,
+      "label_confidence": 0.698,
       "alternatives": [
         {
-          "label": "television",
-          "score": 7.94
+          "label": "chair",
+          "score": 5.16
+        },
+        {
+          "label": "potted plant",
+          "score": 0.48
         },
         {
           "label": "floor lamp",
-          "score": 0.32
-        },
-        {
-          "label": "air cooler",
-          "score": 0.1
-        }
-      ],
-      "closest_seen_m": 1.43,
-      "cameras": [
-        "front",
-        "right"
-      ]
-    },
-    {
-      "id": 68,
-      "label": "sofa",
-      "x": 1.438,
-      "y": -5.051,
-      "hits": 25,
-      "misses": 0.0,
-      "confidence": 0.76,
-      "label_confidence": 0.91,
-      "alternatives": [
-        {
-          "label": "backpack",
-          "score": 0.52
-        },
-        {
-          "label": "laptop",
-          "score": 0.22
-        }
-      ],
-      "closest_seen_m": 0.61,
-      "cameras": [
-        "front",
-        "left",
-        "right"
-      ]
-    },
-    {
-      "id": 71,
-      "label": "sofa",
-      "x": -1.43,
-      "y": -4.984,
-      "hits": 6,
-      "misses": 0.0,
-      "confidence": 0.733,
-      "label_confidence": 0.648,
-      "alternatives": [
-        {
-          "label": "armchair",
-          "score": 0.22
-        },
-        {
-          "label": "television",
-          "score": 0.11
-        }
-      ],
-      "closest_seen_m": 3.45,
-      "cameras": [
-        "front",
-        "right"
-      ]
-    },
-    {
-      "id": 77,
-      "label": "sofa",
-      "x": 0.616,
-      "y": -3.731,
-      "hits": 26,
-      "misses": 1.0,
-      "confidence": 0.841,
-      "label_confidence": 0.525,
-      "alternatives": [
-        {
-          "label": "armchair",
-          "score": 2.51
-        },
-        {
-          "label": "television",
-          "score": 2.08
-        },
-        {
-          "label": "desk",
-          "score": 0.51
-        }
-      ],
-      "closest_seen_m": 0.5,
-      "cameras": [
-        "front",
-        "left",
-        "rear",
-        "right"
-      ]
-    },
-    {
-      "id": 117,
-      "label": "sofa",
-      "x": 3.753,
-      "y": -4.951,
-      "hits": 13,
-      "misses": 0.0,
-      "confidence": 0.76,
-      "label_confidence": 0.365,
-      "alternatives": [
-        {
-          "label": "armchair",
-          "score": 1.81
-        },
-        {
-          "label": "bed",
-          "score": 1.46
-        },
-        {
-          "label": "backpack",
-          "score": 1.38
-        }
-      ],
-      "closest_seen_m": 0.26,
-      "cameras": [
-        "left",
-        "rear",
-        "right"
-      ]
-    },
-    {
-      "id": 131,
-      "label": "sofa",
-      "x": 0.168,
-      "y": -1.227,
-      "hits": 38,
-      "misses": 0.0,
-      "confidence": 0.745,
-      "label_confidence": 0.447,
-      "alternatives": [
-        {
-          "label": "desk",
-          "score": 3.64
-        },
-        {
-          "label": "armchair",
-          "score": 3.43
-        },
-        {
-          "label": "television",
-          "score": 1.53
-        }
-      ],
-      "closest_seen_m": 1.28,
-      "cameras": [
-        "rear",
-        "right"
-      ]
-    },
-    {
-      "id": 20,
-      "label": "television",
-      "x": 3.224,
-      "y": -4.892,
-      "hits": 334,
-      "misses": 0.0,
-      "confidence": 0.823,
-      "label_confidence": 0.516,
-      "alternatives": [
-        {
-          "label": "bed",
-          "score": 22.88
-        },
-        {
-          "label": "sofa",
-          "score": 14.13
-        },
-        {
-          "label": "backpack",
-          "score": 4.18
+          "score": 0.19
         }
       ],
       "closest_seen_m": 0.46,
       "cameras": [
         "front",
         "left",
-        "rear",
-        "right"
-      ]
+        "rear"
+      ],
+      "name": "armchair 6"
     },
     {
-      "id": 51,
-      "label": "television",
-      "x": 3.693,
-      "y": -1.758,
-      "hits": 93,
-      "misses": 58.0,
-      "confidence": 0.913,
-      "label_confidence": 0.43,
+      "id": 129,
+      "label": "armchair",
+      "x": -0.902,
+      "y": 1.797,
+      "hits": 6,
+      "misses": 0.0,
+      "confidence": 0.483,
+      "label_confidence": 0.692,
       "alternatives": [
+        {
+          "label": "trash can",
+          "score": 0.21
+        },
         {
           "label": "sofa",
-          "score": 19.94
-        },
-        {
-          "label": "laptop",
-          "score": 6.01
-        },
-        {
-          "label": "air cooler",
-          "score": 0.81
+          "score": 0.18
         }
       ],
-      "closest_seen_m": 1.31,
+      "closest_seen_m": 2.17,
       "cameras": [
-        "front"
-      ]
+        "left",
+        "right"
+      ],
+      "name": "armchair 7"
     },
     {
-      "id": 82,
-      "label": "television",
-      "x": -1.182,
-      "y": -7.877,
-      "hits": 9,
+      "id": 73,
+      "label": "backpack",
+      "x": -3.132,
+      "y": 2.361,
+      "hits": 80,
       "misses": 1.0,
-      "confidence": 0.686,
-      "label_confidence": 0.893,
+      "confidence": 0.821,
+      "label_confidence": 0.301,
       "alternatives": [
         {
+          "label": "television",
+          "score": 7.34
+        },
+        {
           "label": "armchair",
-          "score": 0.27
+          "score": 6.52
+        },
+        {
+          "label": "sofa",
+          "score": 1.97
         }
       ],
-      "closest_seen_m": 1.26,
+      "closest_seen_m": 0.34,
       "cameras": [
         "front",
         "left",
-        "rear",
-        "right"
-      ]
+        "rear"
+      ],
+      "name": "backpack"
     },
     {
-      "id": 93,
-      "label": "television",
-      "x": 2.375,
-      "y": -8.105,
-      "hits": 10,
+      "id": 117,
+      "label": "coffee table",
+      "x": -3.666,
+      "y": 0.434,
+      "hits": 5,
       "misses": 0.0,
-      "confidence": 0.716,
-      "label_confidence": 0.415,
+      "confidence": 0.563,
+      "label_confidence": 0.582,
       "alternatives": [
         {
-          "label": "air cooler",
-          "score": 0.5
+          "label": "armchair",
+          "score": 0.15
+        },
+        {
+          "label": "floor lamp",
+          "score": 0.14
+        }
+      ],
+      "closest_seen_m": 4.03,
+      "cameras": [
+        "rear"
+      ],
+      "name": "coffee table"
+    },
+    {
+      "id": 28,
+      "label": "floor lamp",
+      "x": -3.646,
+      "y": 3.595,
+      "hits": 22,
+      "misses": 11.0,
+      "confidence": 0.729,
+      "label_confidence": 0.684,
+      "alternatives": [
+        {
+          "label": "television",
+          "score": 2.01
         },
         {
           "label": "computer monitor",
-          "score": 0.48
+          "score": 1.7
+        },
+        {
+          "label": "coffee table",
+          "score": 0.44
+        }
+      ],
+      "closest_seen_m": 0.3,
+      "cameras": [
+        "front",
+        "left",
+        "rear",
+        "right"
+      ],
+      "name": "floor lamp"
+    },
+    {
+      "id": 61,
+      "label": "floor lamp",
+      "x": -7.366,
+      "y": -1.503,
+      "hits": 5,
+      "misses": 0.0,
+      "confidence": 0.714,
+      "label_confidence": 0.488,
+      "alternatives": [
+        {
+          "label": "air cooler",
+          "score": 0.33
+        },
+        {
+          "label": "desk",
+          "score": 0.13
+        }
+      ],
+      "closest_seen_m": 3.11,
+      "cameras": [
+        "front",
+        "rear"
+      ],
+      "name": "floor lamp 2"
+    },
+    {
+      "id": 86,
+      "label": "floor lamp",
+      "x": -4.86,
+      "y": -4.389,
+      "hits": 51,
+      "misses": 1.0,
+      "confidence": 0.868,
+      "label_confidence": 0.976,
+      "alternatives": [
+        {
+          "label": "armchair",
+          "score": 0.17
+        },
+        {
+          "label": "television",
+          "score": 0.09
+        }
+      ],
+      "closest_seen_m": 2.58,
+      "cameras": [
+        "front",
+        "left",
+        "rear"
+      ],
+      "name": "floor lamp 3"
+    },
+    {
+      "id": 103,
+      "label": "floor lamp",
+      "x": -5.761,
+      "y": -3.848,
+      "hits": 16,
+      "misses": 0.0,
+      "confidence": 0.843,
+      "label_confidence": 1.0,
+      "alternatives": [],
+      "closest_seen_m": 2.07,
+      "cameras": [
+        "rear"
+      ],
+      "name": "floor lamp 4"
+    },
+    {
+      "id": 26,
+      "label": "laptop",
+      "x": -6.754,
+      "y": 2.438,
+      "hits": 45,
+      "misses": 0.0,
+      "confidence": 0.747,
+      "label_confidence": 0.436,
+      "alternatives": [
+        {
+          "label": "air cooler",
+          "score": 3.64
+        },
+        {
+          "label": "television",
+          "score": 1.83
+        },
+        {
+          "label": "chair",
+          "score": 0.34
+        }
+      ],
+      "closest_seen_m": 0.8,
+      "cameras": [
+        "front",
+        "left",
+        "rear",
+        "right"
+      ],
+      "name": "laptop"
+    },
+    {
+      "id": 54,
+      "label": "laptop",
+      "x": -4.128,
+      "y": -1.031,
+      "hits": 21,
+      "misses": 0.0,
+      "confidence": 0.785,
+      "label_confidence": 0.502,
+      "alternatives": [
+        {
+          "label": "sofa",
+          "score": 1.69
         },
         {
           "label": "armchair",
-          "score": 0.32
+          "score": 0.4
+        },
+        {
+          "label": "desk",
+          "score": 0.39
         }
       ],
-      "closest_seen_m": 1.28,
+      "closest_seen_m": 0.89,
       "cameras": [
         "front",
         "left",
         "right"
-      ]
+      ],
+      "name": "laptop 2"
+    },
+    {
+      "id": 8,
+      "label": "sofa",
+      "x": -2.381,
+      "y": 1.44,
+      "hits": 99,
+      "misses": 3.0,
+      "confidence": 0.796,
+      "label_confidence": 0.851,
+      "alternatives": [
+        {
+          "label": "armchair",
+          "score": 4.97
+        },
+        {
+          "label": "bed",
+          "score": 0.5
+        },
+        {
+          "label": "chair",
+          "score": 0.24
+        }
+      ],
+      "closest_seen_m": 0.66,
+      "cameras": [
+        "front",
+        "left",
+        "rear",
+        "right"
+      ],
+      "name": "sofa"
+    },
+    {
+      "id": 34,
+      "label": "sofa",
+      "x": -4.395,
+      "y": 0.445,
+      "hits": 97,
+      "misses": 13.0,
+      "confidence": 0.771,
+      "label_confidence": 0.393,
+      "alternatives": [
+        {
+          "label": "desk",
+          "score": 7.54
+        },
+        {
+          "label": "laptop",
+          "score": 4.29
+        },
+        {
+          "label": "floor lamp",
+          "score": 2.58
+        }
+      ],
+      "closest_seen_m": 1.16,
+      "cameras": [
+        "front",
+        "left",
+        "rear",
+        "right"
+      ],
+      "name": "sofa 2"
+    },
+    {
+      "id": 87,
+      "label": "sofa",
+      "x": -4.553,
+      "y": -1.463,
+      "hits": 69,
+      "misses": 6.0,
+      "confidence": 0.786,
+      "label_confidence": 0.61,
+      "alternatives": [
+        {
+          "label": "armchair",
+          "score": 6.8
+        },
+        {
+          "label": "chair",
+          "score": 0.76
+        },
+        {
+          "label": "television",
+          "score": 0.54
+        }
+      ],
+      "closest_seen_m": 0.57,
+      "cameras": [
+        "front",
+        "left"
+      ],
+      "name": "sofa 3"
+    },
+    {
+      "id": 94,
+      "label": "sofa",
+      "x": -3.419,
+      "y": -3.59,
+      "hits": 37,
+      "misses": 1.0,
+      "confidence": 0.62,
+      "label_confidence": 0.409,
+      "alternatives": [
+        {
+          "label": "television",
+          "score": 1.67
+        },
+        {
+          "label": "armchair",
+          "score": 1.05
+        },
+        {
+          "label": "chair",
+          "score": 0.99
+        }
+      ],
+      "closest_seen_m": 1.73,
+      "cameras": [
+        "front",
+        "rear"
+      ],
+      "name": "sofa 4"
+    },
+    {
+      "id": 105,
+      "label": "sofa",
+      "x": -1.018,
+      "y": 0.487,
+      "hits": 70,
+      "misses": 0.0,
+      "confidence": 0.811,
+      "label_confidence": 0.475,
+      "alternatives": [
+        {
+          "label": "armchair",
+          "score": 11.46
+        },
+        {
+          "label": "television",
+          "score": 1.4
+        },
+        {
+          "label": "coffee table",
+          "score": 0.48
+        }
+      ],
+      "closest_seen_m": 1.02,
+      "cameras": [
+        "front",
+        "left",
+        "rear",
+        "right"
+      ],
+      "name": "sofa 5"
+    },
+    {
+      "id": 110,
+      "label": "sofa",
+      "x": -2.535,
+      "y": -0.682,
+      "hits": 45,
+      "misses": 0.0,
+      "confidence": 0.828,
+      "label_confidence": 0.705,
+      "alternatives": [
+        {
+          "label": "armchair",
+          "score": 1.68
+        },
+        {
+          "label": "coffee table",
+          "score": 1.14
+        },
+        {
+          "label": "floor lamp",
+          "score": 0.61
+        }
+      ],
+      "closest_seen_m": 1.29,
+      "cameras": [
+        "front",
+        "left",
+        "rear",
+        "right"
+      ],
+      "name": "sofa 6"
+    },
+    {
+      "id": 120,
+      "label": "sofa",
+      "x": -1.373,
+      "y": 3.351,
+      "hits": 22,
+      "misses": 0.0,
+      "confidence": 0.699,
+      "label_confidence": 0.491,
+      "alternatives": [
+        {
+          "label": "armchair",
+          "score": 1.23
+        },
+        {
+          "label": "cabinet",
+          "score": 0.4
+        },
+        {
+          "label": "trash can",
+          "score": 0.16
+        }
+      ],
+      "closest_seen_m": 3.71,
+      "cameras": [
+        "rear",
+        "right"
+      ],
+      "name": "sofa 7"
+    },
+    {
+      "id": 6,
+      "label": "television",
+      "x": 0.536,
+      "y": 1.7,
+      "hits": 55,
+      "misses": 0.0,
+      "confidence": 0.677,
+      "label_confidence": 0.381,
+      "alternatives": [
+        {
+          "label": "computer monitor",
+          "score": 5.34
+        },
+        {
+          "label": "cabinet",
+          "score": 1.93
+        },
+        {
+          "label": "armchair",
+          "score": 0.88
+        }
+      ],
+      "closest_seen_m": 0.74,
+      "cameras": [
+        "front",
+        "left",
+        "rear",
+        "right"
+      ],
+      "name": "television"
+    },
+    {
+      "id": 10,
+      "label": "television",
+      "x": -1.989,
+      "y": -2.739,
+      "hits": 44,
+      "misses": 3.0,
+      "confidence": 0.777,
+      "label_confidence": 0.649,
+      "alternatives": [
+        {
+          "label": "chair",
+          "score": 2.53
+        },
+        {
+          "label": "laptop",
+          "score": 0.41
+        },
+        {
+          "label": "computer monitor",
+          "score": 0.39
+        }
+      ],
+      "closest_seen_m": 1.08,
+      "cameras": [
+        "front",
+        "left",
+        "rear",
+        "right"
+      ],
+      "name": "television 2"
+    },
+    {
+      "id": 29,
+      "label": "television",
+      "x": -8.209,
+      "y": 1.543,
+      "hits": 17,
+      "misses": 4.0,
+      "confidence": 0.539,
+      "label_confidence": 0.708,
+      "alternatives": [
+        {
+          "label": "laptop",
+          "score": 0.4
+        },
+        {
+          "label": "floor lamp",
+          "score": 0.23
+        },
+        {
+          "label": "window",
+          "score": 0.17
+        }
+      ],
+      "closest_seen_m": 2.28,
+      "cameras": [
+        "front",
+        "left",
+        "rear",
+        "right"
+      ],
+      "name": "television 3"
+    },
+    {
+      "id": 68,
+      "label": "television",
+      "x": -4.059,
+      "y": 4.232,
+      "hits": 8,
+      "misses": 0.0,
+      "confidence": 0.754,
+      "label_confidence": 0.837,
+      "alternatives": [
+        {
+          "label": "staircase",
+          "score": 0.37
+        },
+        {
+          "label": "laptop",
+          "score": 0.08
+        }
+      ],
+      "closest_seen_m": 0.94,
+      "cameras": [
+        "left",
+        "rear",
+        "right"
+      ],
+      "name": "television 4"
+    },
+    {
+      "id": 95,
+      "label": "television",
+      "x": -6.642,
+      "y": 1.971,
+      "hits": 16,
+      "misses": 6.0,
+      "confidence": 0.618,
+      "label_confidence": 1.0,
+      "alternatives": [],
+      "closest_seen_m": 1.25,
+      "cameras": [
+        "rear"
+      ],
+      "name": "television 5"
+    },
+    {
+      "id": 1,
+      "label": "trash can",
+      "x": 2.296,
+      "y": 0.181,
+      "hits": 49,
+      "misses": 0.0,
+      "confidence": 0.81,
+      "label_confidence": 0.961,
+      "alternatives": [
+        {
+          "label": "armchair",
+          "score": 0.29
+        },
+        {
+          "label": "water dispenser",
+          "score": 0.2
+        },
+        {
+          "label": "sofa",
+          "score": 0.11
+        }
+      ],
+      "closest_seen_m": 1.07,
+      "cameras": [
+        "front",
+        "left",
+        "rear",
+        "right"
+      ],
+      "name": "trash can"
+    },
+    {
+      "id": 64,
+      "label": "trash can",
+      "x": -5.092,
+      "y": 3.493,
+      "hits": 25,
+      "misses": 0.0,
+      "confidence": 0.718,
+      "label_confidence": 0.516,
+      "alternatives": [
+        {
+          "label": "floor lamp",
+          "score": 2.31
+        },
+        {
+          "label": "desk",
+          "score": 0.31
+        },
+        {
+          "label": "armchair",
+          "score": 0.13
+        }
+      ],
+      "closest_seen_m": 0.83,
+      "cameras": [
+        "rear",
+        "right"
+      ],
+      "name": "trash can 2"
     }
   ]
 }

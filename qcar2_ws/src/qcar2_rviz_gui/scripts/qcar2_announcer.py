@@ -27,7 +27,7 @@ can never stall a ROS callback, and consecutive identical messages collapse.
 import json
 import math
 import os
-import queue
+import collections
 import time
 import subprocess
 import threading
@@ -52,6 +52,10 @@ from std_msgs.msg import Bool, Int32, String
 from tf2_ros import Buffer, TransformListener
 
 PULSE_SINK = 'alsa_output.platform-sound.analog-stereo'
+# A normal line kept waiting this long behind urgent ones is dropped.
+NORMAL_STALE_SEC = 12.0
+# A safety-shield status line not spoken within this is out of date.
+BRIEF_TTL_SEC = 2.0
 
 # The car's two microphones: a stereo PDM pair on the Orin's DMIC2 port,
 # loaded by /etc/pulse/default.pa as this source. NOT PulseAudio's default
@@ -83,7 +87,9 @@ EC_SOURCE = 'qcar2_mic_ec'
 EC_ARGS = 'analog_gain_control=0 digital_gain_control=0 noise_suppression=0'
 
 
-PIPER_DIR = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz', 'models', 'piper')
+PIPER_DIR = os.path.join(
+    os.environ.get('QCAR_RVIZ_DIR') or os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz'),
+    'models', 'piper')
 
 
 class Speaker:
@@ -133,7 +139,16 @@ class Speaker:
         # The PulseAudio sink itself is still unmuted/volumed below so the
         # hardware is immediately ready the moment they do opt in.
         self.enabled = enabled
-        self.queue = queue.Queue()
+        # Two queues, one speaker: URGENT (answers to what was asked or told
+        # through the mic, and the safety shield's instant lines) is always
+        # spoken next, ahead of anything NORMAL that is waiting -- but never
+        # over a sentence already playing (operator, 2026-10-09: "immediately
+        # addressed, but don't overlap").  NORMAL lines that waited longer
+        # than NORMAL_STALE_SEC behind urgent ones describe a moment that has
+        # passed and are dropped.
+        self.cond = threading.Condition()
+        self.urgent = collections.deque()
+        self.normal = collections.deque()
         self.last_text = None
         threading.Thread(target=self._worker, daemon=True).start()
         self._pactl(['set-sink-mute', PULSE_SINK, '0'])
@@ -200,20 +215,45 @@ class Speaker:
         # whatever the desktop last set.
         self._pactl(['set-sink-volume', PULSE_SINK, f'{percent}%'])
 
-    def say(self, text):
+    def say(self, text, urgent=False, ttl=None):
+        """ttl: seconds after which the line is dropped unspoken (a status
+        line describing a moment -- the safety shield's).  None = keep."""
         if not self.enabled:
             return
-        # Collapse duplicates already waiting, but always let a new sentence
-        # through even if it matches the last SPOKEN one (e.g. a second goal
-        # reached).
-        if not self.queue.empty() and self.last_text == text:
-            return
-        self.last_text = text
-        self.queue.put(text)
+        with self.cond:
+            # Collapse duplicates already waiting, but always let a new
+            # sentence through even if it matches the last SPOKEN one (e.g.
+            # a second goal reached).
+            if any(t == text for t, *_ in self.urgent) or any(t == text for t, *_ in self.normal):
+                return
+            if ttl is not None:
+                # A newer status line replaces any still waiting.
+                self.urgent = collections.deque(i for i in self.urgent if i[2] is None)
+            self.last_text = text
+            (self.urgent if urgent else self.normal).append((text, time.monotonic(), ttl))
+            self.cond.notify()
+
+    def _next(self):
+        with self.cond:
+            while True:
+                # Status lines that waited past their ttl describe a moment
+                # that is over ("obstacle behind" 5 s after it left -- live
+                # test 2026-10-09): drop them.
+                while self.urgent and self.urgent[0][2] is not None and \
+                        time.monotonic() - self.urgent[0][1] > self.urgent[0][2]:
+                    self.logger.info(f'dropped stale: {self.urgent.popleft()[0]}')
+                if self.urgent:
+                    return self.urgent.popleft()[0]
+                while self.normal and time.monotonic() - self.normal[0][1] > NORMAL_STALE_SEC:
+                    dropped = self.normal.popleft()[0]
+                    self.logger.info(f'dropped stale: {dropped}')
+                if self.normal:
+                    return self.normal.popleft()[0]
+                self.cond.wait()
 
     def _worker(self):
         while True:
-            text = self.queue.get()
+            text = self._next()
             if not self.enabled:
                 continue
             self.logger.info(f'SAY: {text}')
@@ -326,6 +366,12 @@ class Announcer(Node):
         # same Speaker so it honours the VOICE on/off button and volume, and so
         # it queues behind obstacle callouts instead of talking over them.
         self.create_subscription(String, '/qcar2/say', self.on_say, 10)
+        # Urgent text: spoken next, ahead of everything waiting (answers to
+        # the mic, the safety shield's instant lines) -- see Speaker.say().
+        self.create_subscription(String, '/qcar2/say_now', self.on_say_now, 10)
+        # Urgent STATUS (the safety shield): spoken next, but dropped if it
+        # could not be said within BRIEF_TTL_SEC -- by then it is out of date.
+        self.create_subscription(String, '/qcar2/say_brief', self.on_say_brief, 10)
         # While the microphone is listening, obstacle callouts are suppressed
         # entirely: they are frequent, and every one of them is speech the
         # mic would have to be deaf through. Important messages (started,
@@ -403,6 +449,16 @@ class Announcer(Node):
         text = (msg.data or '').strip()
         if text:
             self.speaker.say(text)
+
+    def on_say_now(self, msg):
+        text = (msg.data or '').strip()
+        if text:
+            self.speaker.say(text, urgent=True)
+
+    def on_say_brief(self, msg):
+        text = (msg.data or '').strip()
+        if text:
+            self.speaker.say(text, urgent=True, ttl=BRIEF_TTL_SEC)
 
     # ------------------------------------------------------------- obstacles
 

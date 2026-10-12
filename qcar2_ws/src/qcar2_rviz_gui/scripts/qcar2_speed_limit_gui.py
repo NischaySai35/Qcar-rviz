@@ -225,7 +225,9 @@ class NavControlGui(Node):
         self.status.configure(text='SHUTTING DOWN  •  stopping all nodes', fg=WARN)
         self.root.update_idletasks()
         script = os.path.join(
-            os.path.expanduser('~'), 'Desktop', 'Qcar-rviz', 'scripts', 'stop.sh')
+            os.environ.get('QCAR_RVIZ_DIR')
+            or os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz'),
+            'scripts', 'stop.sh')
         if os.path.isfile(script):
             subprocess.Popen([script])
         else:

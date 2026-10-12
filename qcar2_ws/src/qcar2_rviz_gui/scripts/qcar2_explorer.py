@@ -65,6 +65,8 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy)
 from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Bool, ColorRGBA, String
 from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
@@ -96,6 +98,13 @@ def yaw_to_quaternion(yaw):
     return math.sin(yaw / 2.0), math.cos(yaw / 2.0)
 
 
+def segments_cross(a, b, c, d):
+    """True if segment a-b properly crosses segment c-d (2-D points)."""
+    def side(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+    return (side(a, b, c) * side(a, b, d) < 0) and (side(c, d, a) * side(c, d, b) < 0)
+
+
 class Explorer(Node):
 
     def __init__(self):
@@ -106,7 +115,17 @@ class Explorer(Node):
         self.declare_parameter('min_frontier_cells', 8)
         self.declare_parameter('min_goal_distance', 0.70)
         self.declare_parameter('max_goal_distance', 12.0)
-        self.declare_parameter('blacklist_radius', 0.60)
+        # 0.60 -> 0.90 (2026-10-08): the centre of a frontier seen through
+        # glass drifts as that LiDAR wedge grows, and re-appeared just outside
+        # the old radius as a "new" target.
+        self.declare_parameter('blacklist_radius', 0.90)
+        # BUMP SHADOW (2026-10-08, my_room7: 12 failed goals and a bump, all
+        # behind one glass wall). A bump means "something invisible is here";
+        # everything further along that direction is behind it -- the LiDAR
+        # sees floor through glass, but the car can never drive there. So
+        # each bump casts a cone of +-bump_cone_deg away from the car, and no
+        # target inside it is tried again this run.
+        self.declare_parameter('bump_cone_deg', 35.0)
         self.declare_parameter('max_failures_per_frontier', 2)
         self.declare_parameter('goal_timeout_sec', 60.0)
         self.declare_parameter('planning_period_sec', 2.0)
@@ -165,6 +184,7 @@ class Explorer(Node):
         self.unknown_backoff = float(g('unknown_backoff'))
         self.approach_radius = float(g('approach_radius'))
         self.blacklist_ttl = float(g('blacklist_ttl_sec'))
+        self.bump_cone = math.radians(float(g('bump_cone_deg')))
         self.main_clearance = float(g('main_clearance'))
         self.max_speed = float(g('max_speed'))
         self.poor_quality_speed = float(g('poor_quality_speed'))
@@ -207,6 +227,16 @@ class Explorer(Node):
         self.create_subscription(Bool, '/qcar2/explore_enabled', self.on_enabled, LATCHED)
         self.create_subscription(Bool, '/qcar2/drive_blocked', self.on_blocked, LATCHED)
         self.blocked = False
+        self.blocked_at = -1e9
+        # Bump shadows: [(apex_x, apex_y, axis_yaw)], never expire this run.
+        self.no_go = []
+        self.bump_points = []                # bump wall points already seen
+        self.create_subscription(PointCloud2, '/qcar2/bump_obstacles', self.on_bumps, LATCHED)
+        # Glass lines from the vision model (suspected or confirmed):
+        # [(x1, y1, x2, y2)]. Targets past one are tried LAST, never dropped
+        # on the camera's word alone (see the "nonsense glass" note in
+        # qcar2_explore_vlm.py).
+        self.glass_lines = []
         # ROOM AWARENESS (2026-10-06). qcar2_room_analyzer.py measures the room
         # from the map -- outline, coverage, which gaps are worth visiting --
         # and owns the stop rule. qcar2_explore_vlm.py looks through the
@@ -262,6 +292,8 @@ class Explorer(Node):
         glass on the costmap, so the next plan goes around it.
         """
         blocked = bool(msg.data)
+        if blocked and not self.blocked:
+            self.blocked_at = time.monotonic()   # on_bumps turns the mark into a shadow
         if blocked and not self.blocked and (self.goal_handle is not None or self.goal_pending):
             self.get_logger().warn('Car is blocked by something unseen -- abandoning this '
                                    'frontier and blacklisting it.')
@@ -273,6 +305,61 @@ class Explorer(Node):
             self.idle('blocked', 'bumped into something the LiDAR cannot see (glass?)')
             self.event('blocked')
         self.blocked = blocked
+
+    def on_bumps(self, msg):
+        """Turn each new bump mark into a shadow cone (see bump_cone_deg).
+
+        qcar2_bump_guard.py draws a short wall across the bumper that hit.
+        Its midpoint is the apex; the axis points from the car through it,
+        so a rear bump shadows what is behind the car. Only points that
+        arrive within a few seconds of a /qcar2/drive_blocked edge count --
+        the same cloud also carries vision-confirmed glass lines, which
+        appear without the car being anywhere near them.
+        """
+        pts = [(float(x), float(y)) for x, y in
+               point_cloud2.read_points(msg, field_names=('x', 'y'), skip_nans=True)]
+        new = [p for p in pts
+               if not any(math.hypot(p[0] - q[0], p[1] - q[1]) < 0.04 for q in self.bump_points)]
+        self.bump_points.extend(new)
+        car = self.car_xy()
+        if not new or car is None or time.monotonic() - self.blocked_at > 5.0:
+            return
+        ax = sum(p[0] for p in new) / len(new)
+        ay = sum(p[1] for p in new) / len(new)
+        if math.hypot(ax - car[0], ay - car[1]) < 0.05:
+            return
+        axis = math.atan2(ay - car[1], ax - car[0])
+        self.no_go.append((ax, ay, axis))
+        self.get_logger().warn(
+            f'Bump at ({ax:.2f}, {ay:.2f}): nothing behind it (+-{math.degrees(self.bump_cone):.0f} '
+            f'deg, heading {math.degrees(axis):.0f} deg) will be tried again.')
+
+    def behind_bump(self, x, y):
+        """In the shadow of a bump: at it, or further along its direction."""
+        for ax, ay, axis in self.no_go:
+            dx, dy = x - ax, y - ay
+            d = math.hypot(dx, dy)
+            if d < 0.6:
+                return True
+            off = abs((math.atan2(dy, dx) - axis + math.pi) % (2 * math.pi) - math.pi)
+            if off < self.bump_cone:
+                return True
+        return False
+
+    def past_glass(self, car, x, y):
+        """Does the straight line from the car to (x, y) cross a glass line
+        the vision model reported? Lines are padded 0.3 m at each end: the
+        model's estimate of where the pane ends is rough."""
+        for x1, y1, x2, y2 in self.glass_lines:
+            L = math.hypot(x2 - x1, y2 - y1)
+            if L < 1e-3:
+                continue
+            ux, uy = (x2 - x1) / L, (y2 - y1) / L
+            p1 = (x1 - 0.3 * ux, y1 - 0.3 * uy)
+            p2 = (x2 + 0.3 * ux, y2 + 0.3 * uy)
+            if segments_cross(car, (x, y), p1, p2):
+                return True
+        return False
 
     def on_manual(self, msg):
         active = bool(msg.data)
@@ -303,9 +390,13 @@ class Explorer(Node):
 
     def on_hints(self, msg):
         try:
-            self.skip_regions = json.loads(msg.data).get('skip_regions', [])
+            data = json.loads(msg.data)
         except ValueError:
-            pass
+            return
+        self.skip_regions = data.get('skip_regions', [])
+        self.glass_lines = [(c['x1'], c['y1'], c['x2'], c['y2'])
+                            for c in data.get('all_closures', [])
+                            if c.get('kind') == 'glass']
 
     def on_look_done(self, msg):
         if self.looking and msg.data == str(self.looking[0]):
@@ -452,7 +543,10 @@ class Explorer(Node):
             if strikes < self.max_failures:
                 continue
             # Expired strikes no longer count: the map has moved on since.
-            if ttl and rest and now - rest[0] > ttl:
+            # But only ONCE: a place that failed again after its second
+            # chance (2 x max_failures strikes) stays out for good. Without
+            # that, a frontier behind glass came back every 120 s forever.
+            if ttl and rest and now - rest[0] > ttl and strikes < 2 * self.max_failures:
                 continue
             return True
         return False
@@ -619,7 +713,15 @@ class Explorer(Node):
                 tiers[tier].append((f['x'], f['y'], f['size']))
         else:
             tiers[0].extend(self.find_frontiers())
-        tiers = tuple([t for t in tier if not self.tried(t[0], t[1])] for tier in tiers)
+        tiers = tuple([t for t in tier if not self.tried(t[0], t[1])
+                       and not self.behind_bump(t[0], t[1])] for tier in tiers)
+        # Past a glass line the vision model reported: tried last, after
+        # everything on this side of it.
+        if self.glass_lines:
+            far = [t for t in tiers[0] + tiers[1] if self.past_glass(car, t[0], t[1])]
+            tiers = ([t for t in tiers[0] if t not in far],
+                     [t for t in tiers[1] if t not in far],
+                     tiers[2] + far)
         frontiers = tiers[0] + tiers[1] + tiers[2]
         self.frontier_count = len(frontiers)
         self.publish_frontier_markers(frontiers)
@@ -646,11 +748,14 @@ class Explorer(Node):
                 break
 
         if target is None:
-            if self.blacklist and not self.retried:
+            retry = [b for b in self.blacklist if b[2] < 2 * self.max_failures]
+            if retry and not self.retried:
                 # Before declaring the room done, give every failed frontier
-                # one more go on the now-larger map.
+                # one more go on the now-larger map -- except the ones that
+                # already failed on their second chance (and bump shadows,
+                # which live in self.no_go and are never cleared).
                 self.retried = True
-                self.blacklist = []
+                self.blacklist = [b for b in self.blacklist if b[2] >= 2 * self.max_failures]
                 return self.idle('searching', 'retrying frontiers that failed earlier')
             # Settle briefly before declaring done, because a single tick
             # with no frontier can just be a partially-updated map
@@ -806,6 +911,10 @@ class Explorer(Node):
             'goal': ({'x': round(self.current_goal[0], 2),
                       'y': round(self.current_goal[1], 2)}
                      if self.current_goal else None),
+            # Bump shadows, for qcar2_room_analyzer.py (cuts the room there)
+            # and the console.
+            'no_go': [{'x': round(ax, 2), 'y': round(ay, 2), 'yaw': round(axis, 3)}
+                      for ax, ay, axis in self.no_go],
         })
         self.status_pub.publish(msg)
 

@@ -371,7 +371,8 @@ def generate_launch_description():
         if LaunchConfiguration('explore').perform(context).lower() != 'true' or \
                 LaunchConfiguration('use_llm').perform(context).lower() != 'true':
             return []
-        models = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz',
+        models = os.path.join(os.environ.get('QCAR_RVIZ_DIR') or
+                              os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz'),
                               'models', 'cosmos-reason2')
         files = {'2B': ('Cosmos-Reason2-2B-Q8_0.gguf', 'mmproj-Cosmos-Reason2-2B-F16.gguf'),
                  '8B': ('Cosmos-Reason2-8B-Q4_K_M.gguf', 'mmproj-Cosmos-Reason2-8B-F16.gguf')}

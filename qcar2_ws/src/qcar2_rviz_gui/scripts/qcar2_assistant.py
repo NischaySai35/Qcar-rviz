@@ -102,7 +102,7 @@ VLM_SYSTEM = (
     'speak about it as "I see ...", never "the image". Describe only what is '
     'actually visible. Never talk about your own driving, speed or motion. '
     'Answer in at most two short spoken sentences: no lists, no markdown, '
-    'no emojis. If you are not sure, say so.')
+    'no emojis. If you are not sure, say so. Always reply in English.')
 
 # For questions with no picture. The facts line exists because, asked "what
 # is a QCar", the model invented "an electric vehicle for urban environments".
@@ -112,7 +112,42 @@ CHAT_SYSTEM = (
     'LiDAR, four cameras and an NVIDIA Jetson Orin computer; you map rooms, '
     'recognise objects and drive yourself to them. Answer in at most two short '
     'spoken sentences: no lists, no markdown, no emojis. If you do not know, '
-    'say so.')
+    'say so. Always reply in English.')
+
+# SAFETY SHIELD voice (2026-10-09).  qcar2_safety_shield says a short fixed
+# line the instant something happens ("Obstacle in front. Moving back.") --
+# safety speech must never wait for a model.  About a second later this adds
+# ONE friendly line from the model, built from the shield's real facts, and
+# with the camera frame when the car is boxed in or being pestered.  The
+# model only talks: it never decides how the car moves (it is ~1 s; the
+# shield decides every 50 ms).  Operator choices: playful tone, camera only
+# when trapped/pestered, answer "why did you move?" from the facts.
+SHIELD_SYSTEM = (
+    'You are the voice of a small, friendly robot car (a Quanser QCar 2) at a '
+    'live demo. People are testing your safety system by walking, running or '
+    'jumping at you; it keeps you from touching anyone by braking and backing '
+    'away. You will be given FACTS about what just happened. Speak to the '
+    'people around you in one or two short, warm, slightly playful spoken '
+    'sentences. Use only the facts given and what is clearly visible; never '
+    'invent obstacles, speeds or distances. No lists, no markdown, no emojis. '
+    'Always reply in English.')
+# A follow-up that arrives after the moment has passed is noise.
+SHIELD_FOLLOWUP_STALE_SEC = 5.0
+SHIELD_ESCAPE_COOLDOWN_SEC = 10.0     # text-only line after an escape
+SHIELD_PESTER_WINDOW_SEC = 30.0
+SHIELD_PESTER_COUNT = 3               # escapes in the window = being pestered
+SHIELD_PESTER_COOLDOWN_SEC = 30.0
+SHIELD_TRAPPED_AFTER_SEC = 1.0        # boxed in this long before the camera line
+SHIELD_TRAPPED_REPEAT_SEC = 15.0
+SHIELD_CONTEXT_SEC = 60.0             # questions this soon after are about it
+SHIELD_Q = re.compile(
+    r'\b(why|stuck|trapped|blocked|scared|afraid|run away|running away|ran away|'
+    r'moved?|moving|back(ed|ing)? (up|off|away)|escape|escaped|dodge|dodged|'
+    r'hit|bump(ed)?|touch(ed)?|ok|okay|alright|hurt|safe|shield)\b')
+
+# Any CJK / Hangul / Cyrillic / Arabic etc. = not English (see chat_completion).
+NON_ENGLISH = re.compile(r'[Ѐ-ӿ؀-ۿऀ-ॿ぀-ヿ'
+                         r'㐀-鿿가-힯＀-￯]')
 
 # Longest reply read aloud. The model ignores "one sentence" often enough
 # (long run-ons joined with semicolons) that the cap is enforced in code.
@@ -247,6 +282,7 @@ class Assistant(Node):
         # One question at a time: a model call takes up to ~1 s, and two
         # overlapping answers would talk over each other on the speaker.
         self.ask_lock = threading.Lock()
+        self.questions_pending = 0
         self.frame = None                   # latest camera Image
         self.frame_at = 0.0
 
@@ -255,11 +291,22 @@ class Assistant(Node):
 
         self.answer_pub = self.create_publisher(String, '/qcar2/answer', 10)
         self.say_pub = self.create_publisher(String, '/qcar2/say', 10)
+        # Answers to questions are urgent: spoken next, ahead of anything
+        # waiting (qcar2_announcer.py), never over a sentence in progress.
+        self.say_now_pub = self.create_publisher(String, '/qcar2/say_now', 10)
         self.nav_pub = self.create_publisher(String, '/qcar2/nav_to_object', 10)
         self.explore_pub = self.create_publisher(Bool, '/qcar2/explore_enabled', LATCHED)
 
         self.create_subscription(String, '/qcar2/objects', self.on_objects, LATCHED)
         self.create_subscription(String, '/qcar2/ask', self.on_ask, 10)
+        # Safety shield events -> model follow-ups and question context.
+        self.shield_state = 'idle'
+        self.shield_info = {}
+        self.shield_trapped_since = None
+        self.shield_escapes = []            # start times of escape episodes
+        self.shield_log = []                # (time, text) of what it did
+        self.shield_last_followup = {'escape': 0.0, 'pestered': 0.0, 'trapped': 0.0}
+        self.create_subscription(String, '/qcar2/shield_status', self.on_shield_status, LATCHED)
         self.create_subscription(
             Image, g('camera_topic'), self.on_frame,
             QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT))
@@ -445,7 +492,7 @@ class Assistant(Node):
         self.get_logger().info('Vision-language model ready for questions.')
 
     def chat_completion(self, prompt, image_b64=None, max_tokens=120, system=None,
-                        temperature=0.2):
+                        temperature=0.2, _retry=False):
         """One request to llama-server; returns the reply text or None."""
         content = [{'type': 'text', 'text': prompt}]
         if image_b64:
@@ -467,6 +514,18 @@ class Assistant(Node):
         text = (out['choices'][0]['message'].get('content') or '').strip()
         # Cosmos-Reason is a reasoning model; never read its scratchpad aloud.
         text = re.sub(r'<think>.*?</think>', '', text, flags=re.S).strip()
+        # ENGLISH ONLY.  Cosmos-Reason2 is built on a Chinese/English model;
+        # a playful prompt at temperature 0.7 came back entirely in Chinese
+        # (2026-10-09), which the English voice could not even play.  One
+        # retry with the instruction repeated, then give up rather than speak.
+        if NON_ENGLISH.search(text):
+            if not _retry:
+                self.get_logger().warn(f'Model replied in another language, retrying: {text[:60]}')
+                return self.chat_completion(
+                    prompt + '\n\nReply in English only.', image_b64, max_tokens, system,
+                    temperature=min(temperature, 0.2), _retry=True)
+            self.get_logger().warn('Model replied in another language twice; not spoken.')
+            return None
         return text or None
 
     def ask_llm(self, question):
@@ -506,11 +565,17 @@ class Assistant(Node):
             return
         # Off the executor thread: a model call can take ~1 s, and blocking
         # here would also stop camera frames arriving in on_frame().
+        with self.lock:
+            self.questions_pending += 1     # a shield follow-up yields to this
         threading.Thread(target=self.handle_question, args=(question,), daemon=True).start()
 
     def handle_question(self, question):
-        with self.ask_lock:
-            self._handle_question(question)
+        try:
+            with self.ask_lock:
+                self._handle_question(question)
+        finally:
+            with self.lock:
+                self.questions_pending -= 1
 
     def _handle_question(self, question):
         try:
@@ -519,12 +584,23 @@ class Assistant(Node):
             self.get_logger().error(f'Failed to answer "{question}": {exc}')
             answer, data = "Sorry, I could not work that out.", {'error': str(exc)}
         self.get_logger().info(f'Q: "{question}" -> {answer}')
-        self.say(answer)
+        self.say(answer, urgent=True)
         out = String()
         out.data = json.dumps({'question': question, 'answer': answer, 'data': data})
         self.answer_pub.publish(out)
 
     def answer(self, question):
+        # Asked about it right after the shield acted ("why did you move?",
+        # "are you stuck?"): answer from what it really saw.
+        if (self.llm_ok and self.shield_log and
+                time.monotonic() - self.shield_log[-1][0] < SHIELD_CONTEXT_SEC and
+                SHIELD_Q.search(normalize(question))):
+            text = self.chat_completion(
+                f'FACTS (most recent last):\n{self.shield_facts()}\n\n'
+                f'Someone just asked you: "{question}". Answer them.',
+                system=SHIELD_SYSTEM, max_tokens=80, temperature=0.4)
+            if text:
+                return spoken(text), {'intent': 'shield', 'source': 'llm'}
         parsed = self.parse(question)
         intent = parsed.get('intent', 'unknown')
         target = parsed.get('target', '')
@@ -758,10 +834,99 @@ class Assistant(Node):
 
         threading.Thread(target=report, daemon=True).start()
 
-    def say(self, text):
+    def say(self, text, urgent=False):
         msg = String()
         msg.data = text
-        self.say_pub.publish(msg)
+        (self.say_now_pub if urgent else self.say_pub).publish(msg)
+
+    # -------------------------------------------------------- safety shield
+
+    def on_shield_status(self, msg):
+        try:
+            info = json.loads(msg.data)
+        except ValueError:
+            return
+        now = time.monotonic()
+        state = info.get('state', 'idle')
+        prev = self.shield_state
+        self.shield_state, self.shield_info = state, info
+        acting = ('escape', 'hold', 'trapped')
+        if state in ('escape', 'trapped') and info.get('text'):
+            if not self.shield_log or self.shield_log[-1][1] != info['text']:
+                self.shield_log = (self.shield_log + [(now, info['text'])])[-8:]
+        elif state == 'idle' and prev in acting and self.shield_log:
+            self.shield_log = (self.shield_log + [(now, 'Clear again, carrying on.')])[-8:]
+
+        self.shield_trapped_since = (self.shield_trapped_since or now) if state == 'trapped' else None
+        if not self.llm_ok:
+            return                      # the shield's fixed lines already cover it
+        last = self.shield_last_followup
+        if state == 'escape' and prev != 'escape':
+            self.shield_escapes = [t for t in self.shield_escapes
+                                   if now - t < SHIELD_PESTER_WINDOW_SEC] + [now]
+            if (len(self.shield_escapes) >= SHIELD_PESTER_COUNT and
+                    now - last['pestered'] > SHIELD_PESTER_COOLDOWN_SEC):
+                self.shield_followup('pestered', now)
+            elif now - last['escape'] > SHIELD_ESCAPE_COOLDOWN_SEC:
+                self.shield_followup('escape', now)
+        if (self.shield_trapped_since is not None and
+                now - self.shield_trapped_since >= SHIELD_TRAPPED_AFTER_SEC and
+                now - last['trapped'] > SHIELD_TRAPPED_REPEAT_SEC):
+            self.shield_followup('trapped', now)
+
+    def shield_facts(self):
+        now = time.monotonic()
+        lines = [f'{now - t:.0f} s ago: {text}' for t, text in self.shield_log]
+        info = self.shield_info
+        gap = info.get('gap')
+        if isinstance(gap, (int, float)) and gap < 1.0:
+            lines.append(f'Closest thing right now: {gap * 100:.0f} cm from my body.')
+        n = len([t for t in self.shield_escapes if now - t < SHIELD_PESTER_WINDOW_SEC])
+        if n >= 2:
+            lines.append(f'I have had to dodge {n} times in the last half minute.')
+        return '\n'.join(lines) or 'Nothing has happened yet.'
+
+    def shield_followup(self, kind, at):
+        self.shield_last_followup[kind] = at
+        threading.Thread(target=self._shield_followup, args=(kind, at), daemon=True).start()
+
+    def _shield_followup(self, kind, at):
+        # A question being answered (or waiting) comes first: skip rather
+        # than queue a line that would arrive long after the moment.
+        if self.questions_pending or not self.ask_lock.acquire(blocking=False):
+            return
+        try:
+            image = self.camera_jpeg() if kind in ('trapped', 'pestered') else None
+            ask = {
+                'escape': 'Add one short friendly line about what you just did.',
+                'pestered': 'People keep coming at you. Playfully ask them to give '
+                            'you some space.',
+                'trapped': 'You are boxed in and cannot move. Kindly ask the people '
+                           'around you to step back so you can get out.',
+            }[kind]
+            if image:
+                ask += (' The attached image is your front camera right now; you may '
+                        'mention who or what you see in front of you, only if it is '
+                        'clearly visible.')
+            text = self.chat_completion(f'FACTS (most recent last):\n{self.shield_facts()}\n\n{ask}',
+                                        image, system=SHIELD_SYSTEM, max_tokens=70,
+                                        temperature=0.4)
+            if not text:
+                return
+            # Still relevant?  Freed already = do not ask them to move; and
+            # someone asked something meanwhile = their answer goes first.
+            if self.questions_pending:
+                return
+            now = time.monotonic()
+            if kind == 'trapped' and self.shield_state != 'trapped':
+                return
+            if kind != 'trapped' and now - at > SHIELD_FOLLOWUP_STALE_SEC:
+                return
+            text = spoken(text)
+            self.get_logger().info(f'Shield follow-up ({kind}): {text}')
+            self.say(text)
+        finally:
+            self.ask_lock.release()
 
 
 def main():

@@ -81,6 +81,10 @@ ament_target_dependencies(fixed_lidar_frame_virtual geometry_msgs rclcpp tf2_ros
 add_executable(nav2_qcar2_converter src/nav2_qcar_command_convert.cpp)
 ament_target_dependencies(nav2_qcar2_converter rclcpp geometry_msgs nav_msgs action_msgs qcar2_interfaces)
 
+# Safety shield: never touch anything during navigation -- see src/shield_core.hpp.
+add_executable(qcar2_safety_shield src/safety_shield.cpp)
+ament_target_dependencies(qcar2_safety_shield rclcpp std_msgs sensor_msgs nav_msgs tf2_ros qcar2_interfaces)
+
 # # Install Python modules
 # ament_python_install_package(${PROJECT_NAME})
 
@@ -112,6 +116,8 @@ install(TARGETS command
   DESTINATION lib/${PROJECT_NAME})
 
 install(TARGETS nav2_qcar2_converter
+  DESTINATION lib/${PROJECT_NAME})
+install(TARGETS qcar2_safety_shield
   DESTINATION lib/${PROJECT_NAME})
 
 # Install TF

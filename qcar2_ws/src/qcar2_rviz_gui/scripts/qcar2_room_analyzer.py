@@ -135,6 +135,13 @@ class RoomAnalyzer(Node):
         self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
         self.create_subscription(PointCloud2, '/qcar2/bump_obstacles', self.on_bumps, LATCHED)
         self.create_subscription(String, '/qcar2/explore_hints', self.on_hints, LATCHED)
+        # Bump shadows from qcar2_explorer.py. Each is a cut across the room
+        # at the bump, so floor the LiDAR saw THROUGH the glass stops counting
+        # as room (my_room7, 2026-10-08: the room "grew" 52 -> 90 m2 out
+        # through one glass wall, and coverage never meant anything again).
+        self.create_subscription(String, '/qcar2/explore_status', self.on_explore_status, LATCHED)
+        self.no_go = []                      # [(x, y, yaw)]
+        self.cut_half = float(g('bump_cut_half_m', 1.5))
 
         self.map = None
         self.scan = None
@@ -167,6 +174,13 @@ class RoomAnalyzer(Node):
             return
         self.closures = [(c['x1'], c['y1'], c['x2'], c['y2'], c.get('kind', 'glass'))
                          for c in data.get('closures', [])]
+
+    def on_explore_status(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        self.no_go = [(n['x'], n['y'], n['yaw']) for n in data.get('no_go', [])]
 
     def record_track(self):
         pose = self.car_pose()
@@ -243,6 +257,10 @@ class RoomAnalyzer(Node):
             if kind == 'doorway' and self.go_next_room:
                 continue
             cv2.line(wall_img, to_cell(x1, y1), to_cell(x2, y2), 1, thickness=2)
+        # A bump: the invisible thing spans across the direction of travel.
+        for x, y, yaw in self.no_go:
+            px, py = -math.sin(yaw) * self.cut_half, math.cos(yaw) * self.cut_half
+            cv2.line(wall_img, to_cell(x - px, y - py), to_cell(x + px, y + py), 1, thickness=2)
         walls = wall_img.astype(bool)
         closed = ndimage.binary_closing(walls, structure=disk(self.door_close / res),
                                         border_value=0) | walls

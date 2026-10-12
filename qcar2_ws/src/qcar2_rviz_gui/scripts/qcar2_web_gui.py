@@ -52,7 +52,10 @@ from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Bool, Empty, Float32MultiArray, Int32, String, UInt8MultiArray
 from tf2_ros import Buffer, TransformListener
 
-PROJECT_DIR = os.path.join(os.path.expanduser('~'), 'Desktop', 'Qcar-rviz')
+# QCAR_RVIZ_DIR is exported by scripts/env.sh (so a copy of the project uses
+# its own maps/models); ~/Desktop/Qcar-rviz when started some other way.
+PROJECT_DIR = os.environ.get('QCAR_RVIZ_DIR') or os.path.join(
+    os.path.expanduser('~'), 'Desktop', 'Qcar-rviz')
 CAMERAS = ('front', 'rear', 'left', 'right')
 NAV_STATUS_TEXT = {
     GoalStatus.STATUS_EXECUTING: 'NAVIGATING',
@@ -312,6 +315,13 @@ class WebGuiNode(Node):
         self.create_subscription(Float32MultiArray, '/qcar2/obstacle_clearance',
                                  self.on_clearance, 10)
         self.create_subscription(Bool, '/qcar2/drive_stalled', self.on_drive_stalled, LATCHED)
+        # Safety shield (navigation): its state for the banner/button, and
+        # the on/off switch -- see qcar2_nodes/src/safety_shield.cpp.  The
+        # switch is published only on a click, so the launch default (ON)
+        # stands until the operator changes it.
+        self.shield, self.shield_at = {}, 0.0
+        self.create_subscription(String, '/qcar2/shield_status', self.on_shield_status, LATCHED)
+        self.shield_enable_pub = self.create_publisher(Bool, '/qcar2/shield_enable', LATCHED)
         # Room awareness for auto-explore: the analyzer's outline/coverage
         # and the vision model's notes, report and closures (with undo).
         self.create_subscription(String, '/qcar2/room_status', self.on_room_status, LATCHED)
@@ -352,7 +362,9 @@ class WebGuiNode(Node):
             SetParameters, '/nav2_qcar2_command_converter/set_parameters')
 
         # ---- operator settings (published latched so late starters get them)
-        self.voice_on = False   # muted until the operator opts in
+        # Voice ON by default in navigation (operator, 2026-10-09: the safety
+        # shield and answers must be heard at demos); mapping stays opt-in.
+        self.voice_on = self.mode == 'navigation'
         self.voice_volume = 50
         # Microphone starts OFF: an always-listening mic must be opt-in, and
         # the operator should never discover it was hot without asking.
@@ -493,10 +505,25 @@ class WebGuiNode(Node):
         now = time.monotonic()
         warnings = {}
 
+        # The safety shield holding / steering the car explains any "not
+        # moving as commanded" below, so it replaces those banners.
+        shield = self.shield_state()
+        if shield in ('escape', 'hold', 'trapped'):
+            text = self.shield.get('text') or 'Obstacle close'
+            prefix = {'escape': 'SAFETY SHIELD — ', 'hold': 'SAFETY SHIELD — ',
+                      'trapped': 'SAFETY SHIELD: TRAPPED — '}[shield]
+            warnings['shield'] = prefix + text
+            self._stall_since = None
+        elif shield == 'no_lidar':
+            warnings['shield'] = ('SAFETY SHIELD has no LiDAR data — it cannot protect '
+                                  'the car. Check the LiDAR.')
+
         # Commanded to move but the wheels aren't responding: covers
         # e-stop, a sagging battery, and a broken cmd_vel_safe relay
         # alike without having to diagnose which one from here.
-        if self.drive_blocked:
+        if 'shield' in warnings:
+            pass
+        elif self.drive_blocked:
             # Explains the stall below, so it replaces that banner.
             warnings['bumped'] = (
                 'BUMPED INTO SOMETHING THE LIDAR CANNOT SEE (glass or a low '
@@ -765,6 +792,25 @@ class WebGuiNode(Node):
 
     def on_drive_stalled(self, msg):
         self.drive_stalled = bool(msg.data)
+
+    def on_shield_status(self, msg):
+        try:
+            self.shield = json.loads(msg.data)
+            self.shield_at = time.monotonic()
+        except ValueError:
+            pass
+
+    def shield_state(self):
+        """'off' / 'idle' / 'hold' / 'escape' / 'trapped' / 'no_lidar', or
+        None when the shield is not running (mapping mode)."""
+        if not self.shield or time.monotonic() - self.shield_at > 2.0:
+            return None
+        return self.shield.get('state')
+
+    def set_shield(self, on):
+        msg = Bool()
+        msg.data = bool(on)
+        self.shield_enable_pub.publish(msg)
 
     def on_room_status(self, msg):
         try:
@@ -1053,6 +1099,8 @@ class WebServer:
                     'voice': {'on': n.voice_on, 'vol': n.voice_volume},
                     'drive_held': n.drive['held'], 'localized': n.initial_pose_set,
                     'warnings': s.warnings,
+                    'shield': ({'state': n.shield_state(), 'on': bool(n.shield.get('enabled'))}
+                               if n.shield_state() else None),
                     'mic': {'on': n.mic_on, 'source': n.mic_source},
                     'objects': s.objects, 'object_stats': s.object_stats,
                     'answers': s.answers, 'spoken': s.spoken,
@@ -1188,6 +1236,9 @@ class WebServer:
         elif t == 'estop':
             n.set_estop(cmd.get('on', True))
             await self.ack(ws, t, on=n.estop)
+        elif t == 'shield':
+            n.set_shield(cmd.get('on', True))
+            await self.ack(ws, t, on=bool(cmd.get('on', True)))
         elif t == 'stopall':
             n.stop_all()
             await self.ack(ws, t)

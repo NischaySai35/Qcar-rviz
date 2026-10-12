@@ -46,6 +46,10 @@
   button.active { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
   button.stop { background: var(--stop); border-color: var(--stop); color: #fff; font-size: 14px; padding: 13px; letter-spacing: .4px; }
   button.stop.active { background: var(--ok); border-color: var(--ok); color: #fff; }
+  button.shield { font-weight: 800; letter-spacing: .4px; }
+  button.shield.on { border-color: var(--ok); color: var(--ok); }
+  button.shield.acting { background: var(--warn); border-color: var(--warn); color: #fff; }
+  button.shield.trapped { background: var(--stop); border-color: var(--stop); color: #fff; }
   button.warn { background: transparent; border-color: var(--warn); color: var(--warn); }
   button.warn:hover { background: var(--warn); color: #fff; }
   button:disabled { opacity: .4; cursor: not-allowed; }
@@ -209,7 +213,11 @@
   .cams-wrap { position: relative; }
   .cams { display: grid; grid-template-columns: 1fr; gap: 4px; }
   .cams.grid { grid-template-columns: 1fr 1fr; }
-  .cams img { width: 100%; aspect-ratio: 4/3; object-fit: cover; background: #000; border-radius: 7px; border: 1px solid var(--line-soft); display: block; }
+  /* Natural aspect, never cropped: the RealSense front view is 16:9, and a
+     forced 4:3 + object-fit:cover cut ~80 px off each side (and the fps/
+     distance labels drawn there). height:auto keeps the cell exactly the
+     image's size, so the %-positioned detection boxes still line up. */
+  .cams img { width: 100%; height: auto; min-height: 60px; background: #000; border-radius: 7px; border: 1px solid var(--line-soft); display: block; }
   .cams .side { display: none; }
   .cams.grid .side { display: block; }
   /* The side cameras take 2-3 s to open (Quanser driver + first frames), so
@@ -365,6 +373,8 @@
       </div>
 
       <div class="card compact">
+        <button class="navonly shield" id="shieldBtn" style="width:100%; margin-bottom:6px"
+          title="Keeps 8 cm from everything: brakes hard and drives away from anything that comes at the car, without backing into anything else. Click to switch.">SAFETY SHIELD …</button>
         <button class="stop" id="estop" style="width:100%" title="Motion only. LiDAR and all nodes keep running.">EMERGENCY STOP</button>
       </div>
     </div>
@@ -516,7 +526,7 @@ const V3 = {ready: false};
 // They now go on the small dedicated control socket (falling back to the
 // other one), the car acknowledges each one (onControlAck), and if neither
 // socket is open the operator is told the command was NOT sent.
-const CONTROL = new Set(['drive', 'estop', 'stopall', 'explore', 'cancel', 'clear_hints']);
+const CONTROL = new Set(['drive', 'estop', 'stopall', 'explore', 'cancel', 'clear_hints', 'shield']);
 function send(obj) {
   const open = s => s && s.readyState === 1;
   const primary = CONTROL.has(obj.t) ? S.controlWs : S.ws;
@@ -531,6 +541,7 @@ function onControlAck(m) {
   const what = {estop: m.on ? 'EMERGENCY STOP engaged' : 'Emergency stop released',
                 stopall: 'Stopping everything…',
                 explore: m.on ? 'Exploring resumed' : 'Exploring paused',
+                shield: m.on ? 'Safety shield ON' : 'Safety shield OFF — the car will NOT dodge or back away',
                 cancel: 'Goal cancelled', clear_hints: 'Cleared'}[m.cmd];
   if (what) toast(what, m.cmd === 'estop' && m.on ? 'error' : 'info');
 }
@@ -635,7 +646,7 @@ function onState(m) {
   S.pose = m.pose; S.goal = m.goal; S.nav = m.nav; S.speed = m.speed;
   S.steerCmd = m.steer_cmd; S.steerWheels = m.steer_wheels; S.battery = m.battery;
   applyEstop(m.estop); applyCams(m.cams360); applyVoice(m.voice);
-  applyMic(m.mic); applyVoiceIn(m.voice_in);
+  applyMic(m.mic); applyVoiceIn(m.voice_in); applyShield(m.shield);
   applyObjects(m.objects, m.object_stats); applyExplore(m.explore);
   if ('room' in m) applyRoom(m.room, m.hints);       // sent at 2 Hz, not every state
   applyAnswers(m.answers); applyDetections(m.detections); applySaid(m.spoken);
@@ -680,6 +691,24 @@ function onState(m) {
 
   V3.setPose && V3.setPose(m.pose, m.steer_wheels != null ? m.steer_wheels : m.steer_cmd, m.speed);
   V3.setGoal && V3.setGoal(m.goal);
+}
+// Safety shield button: ON/OFF, and orange while it is steering the car,
+// red when it is boxed in.  null = shield not running (mapping mode).
+function applyShield(sh) {
+  const b = $('shieldBtn');
+  S.shieldOn = !!(sh && sh.on);
+  const st = sh ? sh.state : null;
+  b.disabled = !sh;
+  b.classList.toggle('on', S.shieldOn && st === 'idle');
+  b.classList.toggle('acting', st === 'escape' || st === 'hold');
+  b.classList.toggle('trapped', st === 'trapped' || st === 'no_lidar');
+  b.textContent = !sh ? 'SAFETY SHIELD — not running'
+    : !S.shieldOn ? 'SAFETY SHIELD OFF'
+    : st === 'escape' ? 'SAFETY SHIELD — MOVING AWAY'
+    : st === 'hold' ? 'SAFETY SHIELD — BRAKING'
+    : st === 'trapped' ? 'SAFETY SHIELD — TRAPPED'
+    : st === 'no_lidar' ? 'SAFETY SHIELD — NO LIDAR'
+    : 'SAFETY SHIELD ON';
 }
 function applyEstop(on) {
   S.estop = on; const b = $('estop');
@@ -1269,6 +1298,7 @@ vHandle.addEventListener('pointercancel', endVResize);
 
 // ============================================================== controls
 $('estop').onclick = () => send({t: 'estop', on: !S.estop});
+$('shieldBtn').onclick = () => send({t: 'shield', on: !S.shieldOn});
 $('stopAll').onclick = () => { if (confirm('Shut down every node, spin the LiDAR down and zero the motors?')) send({t: 'stopall'}); };
 $('cams360').onclick = () => send({t: 'cams360', on: !S.cams360});
 // ------------------------------------------------------- browser microphone
