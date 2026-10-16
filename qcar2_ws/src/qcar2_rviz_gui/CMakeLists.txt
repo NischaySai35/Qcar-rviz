@@ -29,6 +29,7 @@ install(PROGRAMS
   scripts/qcar2_depth_obstacles.py
   scripts/qcar2_room_analyzer.py
   scripts/qcar2_explore_vlm.py
+  scripts/qcar2_can_bridge.py
   DESTINATION lib/${PROJECT_NAME})
 
 # Browser console served by qcar2_web_gui.py (symlink-installed, so edits to

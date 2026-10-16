@@ -20,3 +20,12 @@ __pycache__/
 # Not in git: they are large binaries fetched by scripts/install_deps.sh,
 # which is reproducible, so committing them would only bloat the history.
 models/
+
+# eSync OTA SDK from Excelfore: contains server credentials
+# (provision-key.json, sdk.cfg), so it must never be committed.
+sdk/
+sdk_new/
+docker_test/
+
+# Repo backup zip (186 MB, over GitHub's 100 MB limit)
+Qcar-rviz.zip

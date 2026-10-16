@@ -98,6 +98,7 @@ CMDLINE_PATTERNS=(
   "qcar2_rviz_gui/qcar2_voice_command\.py"
   "qcar2_rviz_gui/qcar2_explorer\.py"
   "qcar2_rviz_gui/qcar2_assistant\.py"
+  "qcar2_rviz_gui/qcar2_can_bridge\.py"
   "bin/ros2 launch qcar2_rviz_gui"
 )
 

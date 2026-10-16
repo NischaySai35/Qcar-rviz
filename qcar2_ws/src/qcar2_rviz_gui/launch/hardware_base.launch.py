@@ -30,6 +30,20 @@ def generate_launch_description():
     declare_use_front_camera_cmd = DeclareLaunchArgument(
         'use_front_camera', default_value='false',
         description='Start one front CSI camera with a 5 Hz RViz preview')
+    declare_use_vcan_cmd = DeclareLaunchArgument(
+        'use_vcan', default_value='true',
+        description='Write telemetry as CAN frames to vcan0 for the OTA client '
+                    '(create vcan0 once with: sudo scripts/setup_vcan.sh)')
+
+    # Read-only: subscribes to telemetry and writes CAN frames, never
+    # commands the car. Layout: config/qcar2_vcan.dbc.
+    can_bridge_node = Node(
+        package='qcar2_rviz_gui',
+        executable='qcar2_can_bridge.py',
+        name='qcar2_can_bridge',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('use_vcan')),
+    )
 
     qcar2_hardware_node = Node(
         package='qcar2_nodes',
@@ -127,7 +141,9 @@ def generate_launch_description():
     return LaunchDescription([
         declare_use_cameras_cmd,
         declare_use_front_camera_cmd,
+        declare_use_vcan_cmd,
         qcar2_hardware_node,
+        can_bridge_node,
         lidar_node,
         fixed_lidar_frame_node,
         robot_model_launch,

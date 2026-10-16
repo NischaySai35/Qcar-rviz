@@ -1,0 +1,37 @@
+VERSION "QCar2 vcan0 sensor data 2.0"
+
+
+NS_ :
+
+BS_:
+
+BU_: QCAR2 OTA
+
+
+BO_ 256 QCAR_Motion: 6 QCAR2
+ SG_ Speed : 0|16@1- (0.001,0) [-32.767|32.767] "m/s" OTA
+ SG_ YawRate : 16|16@1- (0.001,0) [-32.767|32.767] "rad/s" OTA
+ SG_ SteeringAngle : 32|16@1- (0.0001,0) [-0.6|0.6] "rad" OTA
+
+BO_ 272 QCAR_Odom: 6 QCAR2
+ SG_ PosX : 0|16@1- (0.01,0) [-327.67|327.67] "m" OTA
+ SG_ PosY : 16|16@1- (0.01,0) [-327.67|327.67] "m" OTA
+ SG_ Yaw : 32|16@1- (0.0001,0) [-3.1416|3.1416] "rad" OTA
+
+BO_ 288 QCAR_IMU: 8 QCAR2
+ SG_ AccelX : 0|16@1- (0.01,0) [-327.67|327.67] "m/s^2" OTA
+ SG_ AccelY : 16|16@1- (0.01,0) [-327.67|327.67] "m/s^2" OTA
+ SG_ AccelZ : 32|16@1- (0.01,0) [-327.67|327.67] "m/s^2" OTA
+ SG_ GyroZ : 48|16@1- (0.001,0) [-32.767|32.767] "rad/s" OTA
+
+BO_ 304 QCAR_Battery: 2 QCAR2
+ SG_ BatteryVoltage : 0|16@1+ (0.01,0) [0|655.35] "V" OTA
+
+
+CM_ BU_ QCAR2 "qcar2_can_bridge.py on the QCar2 Orin";
+CM_ BU_ OTA "OTA / cloud telematics client reading vcan0";
+CM_ BO_ 256 "1 Hz. Speed and yaw rate from wheel encoder + IMU odometry";
+CM_ BO_ 272 "1 Hz. Wheel encoder + IMU odometry pose, odom frame (starts at 0,0,0 at launch)";
+CM_ BO_ 288 "1 Hz. Onboard IMU";
+CM_ BO_ 304 "1 Hz. Battery pack voltage";
+CM_ SG_ 256 SteeringAngle "Angle sent to the steering servo (no steering sensor fitted); -32768 raw = no recent command";
