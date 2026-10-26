@@ -1,0 +1,4 @@
+# Runtime files written by yolo_ota_demo.py
+ota_log.txt
+*.bak
+esync-campaigns/*
