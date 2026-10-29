@@ -1,0 +1,29 @@
+cares Version : tags/main-0-g16c873c
+jsonc Version : tags/json-c-0.16-20220414-0-g2f2ddc1
+openssl Version : openssl-3.5.0, sha: 344d0a7
+zstd Version : zstd-1.5.6, sha: 8c29e06cf
+curl Version : curl-8.9.1, sha : b57285
+xl4bus Version : tags/eSync_xl4bus_5.1.1-0-g11670f1
+sqlcipher Version : tags/v4.6.1-0-gc5bd336e
+zlib Version : tags/v1.3.1-0-g51b7f2a
+libxml2 Version : tags/v2.13.9-0-g04af2cab
+zip Version : heads/main-0-gfdb95120
+esync_clientv2 Version : tags/eSync_esync_clientv2_6.8.0-0-g889ea549
+xl4clib Version : tags/eSync_xl4clib_1.7.0-0-g3d383da
+esync_provision Version : tags/eSync_esync_provision_1.1.0-0-g67b0793
+boot_service Version : tags/eSync_boot_service_5.2.1-0-g55640da
+esync_boot Version : tags/eSync_esync_boot_6.4.0-0-gd148afb
+espatch Version : tags/eSync_espatch_5.1.1-0-g8dc852b
+ualib Version : tags/eSync_ualib_2.2.0-0-g6ddc28c
+policy_agent Version : tags/eSync_policy_agent_2.2.0-0-gc5f173e
+hmilib Version : heads/ecs-3112-0-g7dc197f
+uds_utils Version : tags/eSync_uds_utils_2.0.1-0-gb8a898e
+esync_uds_ua Version : tags/eSync_esync_uds_ua_5.1.1-0-g3ee58d7
+workload-ua Version : tags/eSync_workload-ua_1.0.0-0-g0f628d3
+can_sim Version : tags/eSync_can_sim_1.1.0-0-gb11647f
+googletest Version : tags/v1.14.0-0-gf8d7d77c
+esync_framework Version : tags/eSync_esync_framework_1.0.0-0-g49599b4
+test-ua Version : heads/master-0-g74e86ee
+self_update_agent Version : tags/eSync_self_update_agent_1.0.0-0-ge77e7dc
+esync_update_engine Version : tags/eSync_esync_update_engine_1.0.0-0-g79060dd
+qt_esync_hmi_example Version : heads/main-0-gca19c99

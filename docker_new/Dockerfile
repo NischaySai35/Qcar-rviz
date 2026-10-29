@@ -11,7 +11,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         sudo tini ca-certificates procps iproute2 iputils-ping jq zip unzip openssl \
         libssl-dev libsqlcipher-dev libsqlite3-dev libcurl4-openssl-dev libxml2-dev \
-        libtspi-dev libzip-dev libncurses-dev libzstd-dev libproc2-dev can-utils \
+        libtspi-dev libzip-dev libncurses-dev libzstd-dev libproc2-dev can-utils libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ubuntu && chmod 0440 /etc/sudoers.d/ubuntu
